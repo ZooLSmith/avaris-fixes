@@ -1,0 +1,36 @@
+diff --git a/UC2004/ALAudio/Inc/ALAudio.h b/UC2004/ALAudio/Inc/ALAudio.h
+new file mode 100644
+index 00000000..ef5e8b37
+--- /dev/null
++++ b/UC2004/ALAudio/Inc/ALAudio.h
+@@ -0,0 +1,30 @@
++/*=============================================================================
++	ALAudio.h: Project Avaris OpenAL audio package — public header.
++
++	UC2 PC revival module. Replaces XBoxAudio.XACTAudioSubsystem on PC.
++	Bridges UC2's UAudioSubsystem abstract (cue-driven, FName-keyed) onto
++	OpenAL by parsing Avaris.xap at startup and resolving cues to the raw
++	.wav files in UC2004/SoundData/.
++=============================================================================*/
++
++#ifndef _INC_ALAUDIO
++#define _INC_ALAUDIO
++
++#ifndef ALAUDIO_API
++	#define ALAUDIO_API DLL_IMPORT
++#endif
++
++#ifdef WIN32
++#include <windows.h>
++#endif
++
++#include "Core.h"
++#include "Engine.h"
++#include "UnRender.h"
++
++#include "ALAudioSubsystem.h"
++
++#define AUTO_INITIALIZE_REGISTRANTS_ALAUDIO	\
++	UALAudioSubsystem::StaticClass();
++
++#endif

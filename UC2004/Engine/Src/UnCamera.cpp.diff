@@ -1,0 +1,37 @@
+diff --git a/UC2004/Engine/Src/UnCamera.cpp b/UC2004/Engine/Src/UnCamera.cpp
+index ce7ff72c..ffcf72c7 100644
+--- a/UC2004/Engine/Src/UnCamera.cpp
++++ b/UC2004/Engine/Src/UnCamera.cpp
+@@ -185,6 +185,32 @@ UViewport::UViewport() : RenderTarget(this), Profile(NULL)
+ 		Profile->Stats = Cast<UPlayerStats>(StaticConstructObject(UPlayerStats::StaticClass()));
+ 		Profile->Stats->Initialize();
+ 
++		// PC port: pre-populate the transient default profile from the
++		// user's saved .PRO if one exists. Without this, the profile is
++		// constructed with class-default values (MusicVolume=0.4 etc.),
++		// and the SetPlayerOwner -> Initialize -> InitializeProfileValues
++		// chain at player-spawn time pushes those defaults to the audio
++		// subsystem -- so menu music plays at class-default volume from
++		// boot until the menu's profile-binding step loads the user's
++		// real saved values. By loading the .PRO into this transient
++		// profile up front, the same Initialize chain now pushes the
++		// saved values from the first frame.
++		//
++		// LoadProfile clears the transient flag on success; we put it
++		// back so the engine doesn't auto-save this scratch profile and
++		// stomp the real save.
++		{
++			TArray<FString> ProfileNames;
++			if ( UPlayerProfile::ListProfiles(&ProfileNames) && ProfileNames.Num() > 0 )
++			{
++				if ( Profile->LoadProfile(ProfileNames(0)) )
++				{
++					debugf( NAME_Init, TEXT("Viewport: pre-loaded saved profile '%s' (Music=%f FX=%f Voice=%f)"),
++						*ProfileNames(0), Profile->MusicVolume, Profile->SoundFXVolume, Profile->VoiceVolume );
++				}
++			}
++		}
++
+ 		Profile->DirtyMask |= UCONST_kTransientProfile;
+ 	}
+ 

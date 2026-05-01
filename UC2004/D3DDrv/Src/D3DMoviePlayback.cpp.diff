@@ -1,0 +1,1348 @@
+diff --git a/UC2004/D3DDrv/Src/D3DMoviePlayback.cpp b/UC2004/D3DDrv/Src/D3DMoviePlayback.cpp
+new file mode 100644
+index 00000000..4c48f3f6
+--- /dev/null
++++ b/UC2004/D3DDrv/Src/D3DMoviePlayback.cpp
+@@ -0,0 +1,1342 @@
++/*=============================================================================
++	D3DMoviePlayback.cpp: PC port of UC2's cutscene playback. Replaces the
++	Xbox-only XMV path (UC2004/XboxDrv/Src/XboxMovieThread.cpp). Decodes
++	UC2's .xmv files (WMV2 video + ADPCM IMA WAV audio) at runtime via
++	dynamically-loaded FFmpeg shared libraries:
++
++	  System/avformat-62.dll
++	  System/avcodec-62.dll
++	  System/avutil-60.dll
++	  System/swscale-9.dll
++	  System/swresample-6.dll
++
++	No FFmpeg headers are included -- VC7.1 chokes on parts of modern
++	FFmpeg headers (stdint.h, av_always_inline, etc.). Instead we
++	forward-declare opaque FFmpeg types and rely only on the documented
++	stable struct prefixes (AVFormatContext->streams/nb_streams,
++	AVStream->codecpar, AVCodecParameters->codec_id/codec_type/width/
++	height) and the documented stable function signatures.
++
++	Lives in D3DDrv (not WinDrv) because video rendering needs direct
++	IDirect3DDevice8 access -- WinDrv doesn't link D3D8.
++=============================================================================*/
++
++#include "D3DDrv.h"
++#include "D3DResource.h"
++#include "D3DRenderDevice.h"
++
++// ---------------------------------------------------------------------------
++// Minimal FFmpeg type forward declarations -- just enough to call the API.
++// ---------------------------------------------------------------------------
++
++typedef signed char    av_int8;
++typedef unsigned char  av_uint8;
++typedef short          av_int16;
++typedef unsigned short av_uint16;
++typedef int            av_int32;
++typedef unsigned int   av_uint32;
++typedef __int64        av_int64;
++typedef unsigned __int64 av_uint64;
++
++struct AVFormatContext;
++struct AVCodecContext;
++struct AVCodec;
++struct AVPacket;
++struct AVFrame;
++struct AVStream;
++struct AVCodecParameters;
++struct AVDictionary;
++struct AVInputFormat;
++struct SwsContext;
++
++enum AVMediaType
++{
++	AVMEDIA_TYPE_UNKNOWN = -1,
++	AVMEDIA_TYPE_VIDEO,
++	AVMEDIA_TYPE_AUDIO,
++	AVMEDIA_TYPE_DATA,
++	AVMEDIA_TYPE_SUBTITLE,
++	AVMEDIA_TYPE_ATTACHMENT,
++	AVMEDIA_TYPE_NB
++};
++
++// AVERROR_EOF as defined by libavutil error.h
++#define AV_ERROR_EOF (-(((av_int32)'E')|(((av_int32)'O')<<8)|(((av_int32)'F')<<16)|(((av_int32)' ')<<24)))
++#define AV_EAGAIN    (-11)
++
++// AVFormatContext prefix layout. FFmpeg 5.x+ guarantees stability of the
++// field order up to streams/nb_streams across major versions.
++struct AVFormatContextPrefix
++{
++	const void*           av_class;
++	const AVInputFormat*  iformat;
++	const void*           oformat;
++	void*                 priv_data;
++	void*                 pb;            // AVIOContext*
++	int                   ctx_flags;
++	unsigned int          nb_streams;
++	AVStream**            streams;
++};
++
++// AVCodecParameters prefix -- only the fields we need.
++struct AVCodecParametersPrefix
++{
++	int        codec_type;        // enum AVMediaType
++	int        codec_id;          // enum AVCodecID
++	av_uint32  codec_tag;
++	av_uint8*  extradata;
++	int        extradata_size;
++	void*      coded_side_data;
++	int        nb_coded_side_data;
++	int        format;
++	av_int64   bit_rate;
++	int        bits_per_coded_sample;
++	int        bits_per_raw_sample;
++	int        profile;
++	int        level;
++	int        width;
++	int        height;
++};
++
++// AVStream prefix -- codecpar moved earlier in FFmpeg 5.x; stable in 7.x.
++struct AVStreamPrefix
++{
++	const void*               av_class;
++	int                       index;
++	int                       id;
++	AVCodecParametersPrefix*  codecpar;
++};
++
++// AVPacket prefix -- stable across FFmpeg majors. Needed for stream_index
++// so we can route packets to the correct decoder.
++//
++// CRITICAL: UC2's project compiles with /Zp4 (4-byte default struct packing)
++// but the FFmpeg DLLs were built with /Zp8. The int64_t pts/dts members get
++// 4 bytes of padding before them under /Zp8 but no padding under /Zp4 --
++// every field after them lands at a different offset. Force /Zp8 here so
++// stream_index hits FFmpeg's actual offset 32 (without #pragma pack it
++// would land at 28, and stream-index gating would silently skip every
++// video packet).
++#pragma pack(push, 8)
++struct AVPacketPrefix
++{
++	void*    buf;
++	av_int64 pts;
++	av_int64 dts;
++	av_uint8* data;
++	int      size;
++	int      stream_index;
++};
++#pragma pack(pop)
++
++// ---------------------------------------------------------------------------
++// FFmpeg function pointer typedefs.
++// ---------------------------------------------------------------------------
++
++typedef int    (*PFN_avformat_open_input)( AVFormatContext** ps, const char* url, const AVInputFormat* fmt, AVDictionary** options );
++typedef int    (*PFN_avformat_find_stream_info)( AVFormatContext* ic, AVDictionary** options );
++typedef void   (*PFN_avformat_close_input)( AVFormatContext** s );
++typedef int    (*PFN_av_read_frame)( AVFormatContext* s, AVPacket* pkt );
++typedef av_uint32 (*PFN_avformat_version)(void);
++
++typedef const AVCodec* (*PFN_avcodec_find_decoder)( int codec_id );
++typedef AVCodecContext* (*PFN_avcodec_alloc_context3)( const AVCodec* codec );
++typedef int    (*PFN_avcodec_parameters_to_context)( AVCodecContext* codec, const AVCodecParametersPrefix* par );
++typedef int    (*PFN_avcodec_open2)( AVCodecContext* avctx, const AVCodec* codec, AVDictionary** options );
++typedef int    (*PFN_avcodec_send_packet)( AVCodecContext* avctx, const AVPacket* avpkt );
++typedef int    (*PFN_avcodec_receive_frame)( AVCodecContext* avctx, AVFrame* frame );
++typedef void   (*PFN_avcodec_free_context)( AVCodecContext** avctx );
++typedef av_uint32 (*PFN_avcodec_version)(void);
++
++typedef AVPacket* (*PFN_av_packet_alloc)(void);
++typedef void   (*PFN_av_packet_free)( AVPacket** pkt );
++typedef void   (*PFN_av_packet_unref)( AVPacket* pkt );
++typedef AVFrame* (*PFN_av_frame_alloc)(void);
++typedef void   (*PFN_av_frame_free)( AVFrame** frame );
++
++typedef void   (*PFN_av_log_set_level)( int level );
++#define AV_LOG_QUIET    -8
++#define AV_LOG_PANIC     0
++#define AV_LOG_FATAL     8
++#define AV_LOG_ERROR    16
++#define AV_LOG_WARNING  24
++#define AV_LOG_INFO     32
++
++// AVFrame prefix -- documented stable layout. Same /Zp8 packing concern as
++// AVPacket: int64_t pts/pkt_dts later in the struct mean the audio
++// sample_rate field at offset 128 only lands there under 8-byte alignment.
++#pragma pack(push, 8)
++struct AVFrameLayout
++{
++	av_uint8*   data[8];           // off   0
++	int         linesize[8];       // off  32
++	av_uint8**  extended_data;     // off  64
++	int         width;             // off  68
++	int         height;            // off  72
++	int         nb_samples;        // off  76 (audio)
++	int         format;            // off  80 (AVSampleFormat for audio)
++	int         pict_type;         // off  84
++	int         sar_num;           // off  88
++	int         sar_den;           // off  92
++	av_int64    pts;               // off  96
++	av_int64    pkt_dts;           // off 104
++	int         tb_num;            // off 112
++	int         tb_den;            // off 116
++	int         quality;           // off 120
++	int         repeat_pict;       // off 124
++	int         sample_rate;       // off 128 (audio)
++};
++#pragma pack(pop)
++
++// Audio sample format enum values we care about (from AVSampleFormat).
++#define AV_SAMPLE_FMT_S16   1
++#define AV_SAMPLE_FMT_S16P  6
++
++// AVPixelFormat enum values we care about.
++#define AV_PIX_FMT_YUV420P    0
++#define AV_PIX_FMT_BGRA      28
++
++// libswscale: convert decoded YUV planes to BGRA we can hand to D3D8.
++typedef SwsContext* (*PFN_sws_getContext)(
++	int srcW, int srcH, int srcFormat,
++	int dstW, int dstH, int dstFormat,
++	int flags, void* srcFilter, void* dstFilter, const double* param );
++typedef int  (*PFN_sws_scale)(
++	SwsContext* c, const av_uint8* const* srcSlice, const int* srcStride,
++	int srcSliceY, int srcSliceH, av_uint8* const* dst, const int* dstStride );
++typedef void (*PFN_sws_freeContext)( SwsContext* swsContext );
++#define SWS_BILINEAR 2
++
++// OpenAL: streaming audio source for the cutscene audio track. Re-uses the
++// same OpenAL DLL the engine's ALAudio subsystem already has loaded, so
++// LoadLibrary just bumps the refcount.
++typedef av_uint32 ALuint;
++typedef av_int32  ALint;
++typedef av_int32  ALenum;
++typedef av_int32  ALsizei;
++typedef void      ALvoid;
++
++#define AL_BUFFERS_PROCESSED  0x1016
++#define AL_SOURCE_STATE       0x1010
++#define AL_PLAYING            0x1012
++#define AL_FORMAT_STEREO16    0x1103
++#define AL_FORMAT_MONO16      0x1101
++
++typedef void  (__cdecl *PFN_alGenSources)( ALsizei n, ALuint* sources );
++typedef void  (__cdecl *PFN_alDeleteSources)( ALsizei n, const ALuint* sources );
++typedef void  (__cdecl *PFN_alGenBuffers)( ALsizei n, ALuint* buffers );
++typedef void  (__cdecl *PFN_alDeleteBuffers)( ALsizei n, const ALuint* buffers );
++typedef void  (__cdecl *PFN_alBufferData)( ALuint buffer, ALenum format, const ALvoid* data, ALsizei size, ALsizei freq );
++typedef void  (__cdecl *PFN_alSourceQueueBuffers)( ALuint source, ALsizei n, const ALuint* buffers );
++typedef void  (__cdecl *PFN_alSourceUnqueueBuffers)( ALuint source, ALsizei n, ALuint* buffers );
++typedef void  (__cdecl *PFN_alSourcePlay)( ALuint source );
++typedef void  (__cdecl *PFN_alSourceStop)( ALuint source );
++typedef void  (__cdecl *PFN_alGetSourcei)( ALuint source, ALenum param, ALint* value );
++typedef void  (__cdecl *PFN_alSourcef)( ALuint source, ALenum param, float value );
++
++// ALAudio cutscene hooks (see UC2004/ALAudio/Inc/ALAudioSubsystem.h).
++typedef void  (*PFN_UCMovieAudioDuck)( int bDucked );
++typedef float (*PFN_UCMovieGetCategoryVolume)( int category );
++// Cutscene audio rides the SFX volume slider, not music. The XMVs contain
++// dialogue + foley + score baked into a single track that the user expects
++// to control with the same slider as gameplay sounds.
++#define MOVIE_VOLUME_CATEGORY  1   // UAudioSubsystem::VOLUME_FX
++#define AL_GAIN                0x100A
++
++// ---------------------------------------------------------------------------
++// Resolved function pointer table.
++// ---------------------------------------------------------------------------
++
++struct FFmpegAPI
++{
++	HMODULE hAvFormat;
++	HMODULE hAvCodec;
++	HMODULE hAvUtil;
++	HMODULE hSwScale;
++	HMODULE hSwResample;
++
++	PFN_avformat_version              avformat_version;
++	PFN_avformat_open_input           avformat_open_input;
++	PFN_avformat_find_stream_info     avformat_find_stream_info;
++	PFN_avformat_close_input          avformat_close_input;
++	PFN_av_read_frame                 av_read_frame;
++
++	PFN_avcodec_version               avcodec_version;
++	PFN_avcodec_find_decoder          avcodec_find_decoder;
++	PFN_avcodec_alloc_context3        avcodec_alloc_context3;
++	PFN_avcodec_parameters_to_context avcodec_parameters_to_context;
++	PFN_avcodec_open2                 avcodec_open2;
++	PFN_avcodec_send_packet           avcodec_send_packet;
++	PFN_avcodec_receive_frame         avcodec_receive_frame;
++	PFN_avcodec_free_context          avcodec_free_context;
++
++	PFN_av_packet_alloc               av_packet_alloc;
++	PFN_av_packet_free                av_packet_free;
++	PFN_av_packet_unref               av_packet_unref;
++	PFN_av_frame_alloc                av_frame_alloc;
++	PFN_av_frame_free                 av_frame_free;
++
++	PFN_av_log_set_level              av_log_set_level;
++
++	PFN_sws_getContext                sws_getContext;
++	PFN_sws_scale                     sws_scale;
++	PFN_sws_freeContext               sws_freeContext;
++
++	HMODULE hOpenAL;
++	PFN_alGenSources                  alGenSources;
++	PFN_alDeleteSources               alDeleteSources;
++	PFN_alGenBuffers                  alGenBuffers;
++	PFN_alDeleteBuffers               alDeleteBuffers;
++	PFN_alBufferData                  alBufferData;
++	PFN_alSourceQueueBuffers          alSourceQueueBuffers;
++	PFN_alSourceUnqueueBuffers        alSourceUnqueueBuffers;
++	PFN_alSourcePlay                  alSourcePlay;
++	PFN_alSourceStop                  alSourceStop;
++	PFN_alGetSourcei                  alGetSourcei;
++	PFN_alSourcef                     alSourcef;
++
++	HMODULE hALAudio;
++	PFN_UCMovieAudioDuck              UCMovieAudioDuck;
++	PFN_UCMovieGetCategoryVolume      UCMovieGetCategoryVolume;
++
++	UBOOL bAudioLoaded;
++
++	UBOOL bLoaded;
++};
++
++static FFmpegAPI GFFmpeg = { 0 };
++static UBOOL     GMoviePlaying = FALSE;
++
++#define LOAD_FN(mod, fn) \
++	GFFmpeg.fn = (PFN_##fn) GetProcAddress( GFFmpeg.mod, #fn ); \
++	if( !GFFmpeg.fn ) { debugf( TEXT("[Movie] " #fn " not found in " #mod) ); return FALSE; }
++
++static UBOOL FFmpegLoad()
++{
++	if( GFFmpeg.bLoaded )
++		return TRUE;
++
++	GFFmpeg.hAvFormat   = LoadLibraryA( "avformat-62.dll" );
++	GFFmpeg.hAvCodec    = LoadLibraryA( "avcodec-62.dll" );
++	GFFmpeg.hAvUtil     = LoadLibraryA( "avutil-60.dll" );
++	GFFmpeg.hSwScale    = LoadLibraryA( "swscale-9.dll" );
++	GFFmpeg.hSwResample = LoadLibraryA( "swresample-6.dll" );
++
++	if( !GFFmpeg.hAvFormat || !GFFmpeg.hAvCodec || !GFFmpeg.hAvUtil )
++	{
++		debugf( TEXT("[Movie] FFmpeg DLLs not found (avformat-62/avcodec-62/avutil-60). Movie playback disabled.") );
++		return FALSE;
++	}
++
++	LOAD_FN( hAvFormat, avformat_version );
++	LOAD_FN( hAvFormat, avformat_open_input );
++	LOAD_FN( hAvFormat, avformat_find_stream_info );
++	LOAD_FN( hAvFormat, avformat_close_input );
++	LOAD_FN( hAvFormat, av_read_frame );
++
++	LOAD_FN( hAvCodec,  avcodec_version );
++	LOAD_FN( hAvCodec,  avcodec_find_decoder );
++	LOAD_FN( hAvCodec,  avcodec_alloc_context3 );
++	LOAD_FN( hAvCodec,  avcodec_parameters_to_context );
++	LOAD_FN( hAvCodec,  avcodec_open2 );
++	LOAD_FN( hAvCodec,  avcodec_send_packet );
++	LOAD_FN( hAvCodec,  avcodec_receive_frame );
++	LOAD_FN( hAvCodec,  avcodec_free_context );
++	LOAD_FN( hAvCodec,  av_packet_alloc );
++	LOAD_FN( hAvCodec,  av_packet_free );
++	LOAD_FN( hAvCodec,  av_packet_unref );
++
++	LOAD_FN( hAvUtil,   av_frame_alloc );
++	LOAD_FN( hAvUtil,   av_frame_free );
++	LOAD_FN( hAvUtil,   av_log_set_level );
++
++	LOAD_FN( hSwScale,  sws_getContext );
++	LOAD_FN( hSwScale,  sws_scale );
++	LOAD_FN( hSwScale,  sws_freeContext );
++
++	// OpenAL is optional -- already loaded by ALAudio subsystem; we just
++	// bump the refcount. If the engine is using a different audio system
++	// (NullAudio etc.), audio playback in cutscenes is silently skipped.
++	GFFmpeg.hOpenAL = LoadLibraryA( "OpenAL32.dll" );
++	if( GFFmpeg.hOpenAL )
++	{
++		GFFmpeg.alGenSources           = (PFN_alGenSources)GetProcAddress( GFFmpeg.hOpenAL, "alGenSources" );
++		GFFmpeg.alDeleteSources        = (PFN_alDeleteSources)GetProcAddress( GFFmpeg.hOpenAL, "alDeleteSources" );
++		GFFmpeg.alGenBuffers           = (PFN_alGenBuffers)GetProcAddress( GFFmpeg.hOpenAL, "alGenBuffers" );
++		GFFmpeg.alDeleteBuffers        = (PFN_alDeleteBuffers)GetProcAddress( GFFmpeg.hOpenAL, "alDeleteBuffers" );
++		GFFmpeg.alBufferData           = (PFN_alBufferData)GetProcAddress( GFFmpeg.hOpenAL, "alBufferData" );
++		GFFmpeg.alSourceQueueBuffers   = (PFN_alSourceQueueBuffers)GetProcAddress( GFFmpeg.hOpenAL, "alSourceQueueBuffers" );
++		GFFmpeg.alSourceUnqueueBuffers = (PFN_alSourceUnqueueBuffers)GetProcAddress( GFFmpeg.hOpenAL, "alSourceUnqueueBuffers" );
++		GFFmpeg.alSourcePlay           = (PFN_alSourcePlay)GetProcAddress( GFFmpeg.hOpenAL, "alSourcePlay" );
++		GFFmpeg.alSourceStop           = (PFN_alSourceStop)GetProcAddress( GFFmpeg.hOpenAL, "alSourceStop" );
++		GFFmpeg.alGetSourcei           = (PFN_alGetSourcei)GetProcAddress( GFFmpeg.hOpenAL, "alGetSourcei" );
++		GFFmpeg.alSourcef              = (PFN_alSourcef)GetProcAddress( GFFmpeg.hOpenAL, "alSourcef" );
++		GFFmpeg.bAudioLoaded =
++			GFFmpeg.alGenSources && GFFmpeg.alDeleteSources &&
++			GFFmpeg.alGenBuffers && GFFmpeg.alDeleteBuffers &&
++			GFFmpeg.alBufferData &&
++			GFFmpeg.alSourceQueueBuffers && GFFmpeg.alSourceUnqueueBuffers &&
++			GFFmpeg.alSourcePlay && GFFmpeg.alSourceStop &&
++			GFFmpeg.alGetSourcei && GFFmpeg.alSourcef;
++		debugf( TEXT("[Movie] OpenAL: %s"),
++			GFFmpeg.bAudioLoaded ? TEXT("ready") : TEXT("entry points missing, audio off") );
++	}
++	else
++	{
++		debugf( TEXT("[Movie] OpenAL32.dll not found, cutscene audio disabled") );
++	}
++
++	// ALAudio cutscene hooks: optional. If ALAudio.dll isn't loaded
++	// (NullAudio device, etc.) the cutscene will play with default gain
++	// and won't pause the engine's existing audio.
++	GFFmpeg.hALAudio = LoadLibraryA( "ALAudio.dll" );
++	if( GFFmpeg.hALAudio )
++	{
++		GFFmpeg.UCMovieAudioDuck = (PFN_UCMovieAudioDuck)GetProcAddress( GFFmpeg.hALAudio, "UCMovieAudioDuck" );
++		GFFmpeg.UCMovieGetCategoryVolume = (PFN_UCMovieGetCategoryVolume)GetProcAddress( GFFmpeg.hALAudio, "UCMovieGetCategoryVolume" );
++		debugf( TEXT("[Movie] ALAudio cutscene hooks: %s"),
++			(GFFmpeg.UCMovieAudioDuck && GFFmpeg.UCMovieGetCategoryVolume) ? TEXT("ready") : TEXT("missing") );
++	}
++
++	// Quiet FFmpeg's per-codec stderr chatter ("header damaged", "ignoring
++	// overflow", etc.). UC2's WMV2 stream isn't strict-spec-compliant so it
++	// trips these errors constantly; the decoder still produces frames, so
++	// suppress everything below FATAL. (FFmpeg log level: lower = more
++	// severe; AV_LOG_ERROR=16 still shows the overflow noise; FATAL=8 hides
++	// it but keeps panic/fatal visible.)
++	GFFmpeg.av_log_set_level( AV_LOG_FATAL );
++
++	av_uint32 fmtVer = GFFmpeg.avformat_version();
++	av_uint32 codVer = GFFmpeg.avcodec_version();
++	debugf( TEXT("[Movie] FFmpeg loaded: avformat %d.%d.%d  avcodec %d.%d.%d"),
++		(fmtVer>>16)&0xFF, (fmtVer>>8)&0xFF, fmtVer&0xFF,
++		(codVer>>16)&0xFF, (codVer>>8)&0xFF, codVer&0xFF );
++
++	GFFmpeg.bLoaded = TRUE;
++	return TRUE;
++}
++
++// ---------------------------------------------------------------------------
++// Fullscreen-quad vertex format. Pre-transformed coords (XYZRHW) bypass the
++// world/view/projection matrices entirely -- we just hand pixel-space verts
++// straight to the rasteriser.
++// ---------------------------------------------------------------------------
++
++struct MovieVertex
++{
++	FLOAT x, y, z, rhw;
++	FLOAT u, v;
++};
++#define MOVIE_FVF (D3DFVF_XYZRHW | D3DFVF_TEX1)
++
++// ---------------------------------------------------------------------------
++// Find the active D3D8 device + viewport via the engine's client.
++// Returns NULL if there's no render device or no active viewport.
++// ---------------------------------------------------------------------------
++
++static UD3DRenderDevice* GetActiveD3DDevice( UViewport** outViewport )
++{
++	if( outViewport ) *outViewport = NULL;
++	if( !UTexture::__Client || UTexture::__Client->Viewports.Num() == 0 )
++		return NULL;
++	UViewport* Vp = UTexture::__Client->Viewports(0);
++	if( !Vp || !Vp->RenDev )
++		return NULL;
++	UD3DRenderDevice* RenDev = Cast<UD3DRenderDevice>( Vp->RenDev );
++	if( !RenDev || !RenDev->Direct3DDevice8 )
++		return NULL;
++	if( outViewport ) *outViewport = Vp;
++	return RenDev;
++}
++
++// ---------------------------------------------------------------------------
++// Pump Windows messages briefly so the window stays responsive during the
++// blocking play loop. Returns TRUE if the user pressed any key (skip).
++// ---------------------------------------------------------------------------
++
++static UBOOL PumpAndCheckSkip()
++{
++	UBOOL bSkip = FALSE;
++	MSG Msg;
++	while( PeekMessage( &Msg, NULL, 0, 0, PM_REMOVE ) )
++	{
++		if( Msg.message == WM_KEYDOWN ||
++			Msg.message == WM_LBUTTONDOWN ||
++			Msg.message == WM_RBUTTONDOWN ||
++			Msg.message == WM_QUIT )
++			bSkip = TRUE;
++		TranslateMessage( &Msg );
++		DispatchMessage( &Msg );
++	}
++	return bSkip;
++}
++
++// ---------------------------------------------------------------------------
++// Decode and play a movie file synchronously. Returns when the file ends or
++// the user presses any key.
++// ---------------------------------------------------------------------------
++
++void DecodeMovieFile( const TCHAR* MoviePath )
++{
++	if( !FFmpegLoad() )
++		return;
++
++	UViewport* Viewport = NULL;
++	UD3DRenderDevice* RenDev = GetActiveD3DDevice( &Viewport );
++	if( !RenDev )
++	{
++		debugf( TEXT("[Movie] No active D3D device, skipping playback of %s"), MoviePath );
++		return;
++	}
++	IDirect3DDevice8* Device = RenDev->Direct3DDevice8;
++
++	// Convert UE2 TCHAR (wide) path to ANSI for FFmpeg's UTF-8 url param.
++	char AnsiPath[1024];
++	const TCHAR* Src = MoviePath;
++	int i = 0;
++	while( *Src && i < (int)sizeof(AnsiPath)-1 )
++		AnsiPath[i++] = (char)*Src++;
++	AnsiPath[i] = 0;
++
++	debugf( TEXT("[Movie] Opening %s"), MoviePath );
++
++	AVFormatContext* fmtCtx = NULL;
++	int rc = GFFmpeg.avformat_open_input( &fmtCtx, AnsiPath, NULL, NULL );
++	if( rc != 0 )
++	{
++		debugf( TEXT("[Movie] avformat_open_input failed: %d"), rc );
++		return;
++	}
++
++	rc = GFFmpeg.avformat_find_stream_info( fmtCtx, NULL );
++	if( rc < 0 )
++	{
++		debugf( TEXT("[Movie] avformat_find_stream_info failed: %d"), rc );
++		GFFmpeg.avformat_close_input( &fmtCtx );
++		return;
++	}
++
++	AVFormatContextPrefix* fc = (AVFormatContextPrefix*)fmtCtx;
++
++	int videoStream = -1, audioStream = -1;
++	int width = 0, height = 0;
++	const AVCodec* videoCodec = NULL;
++	const AVCodec* audioCodec = NULL;
++	for( unsigned int s = 0; s < fc->nb_streams; s++ )
++	{
++		AVStreamPrefix* st = (AVStreamPrefix*)fc->streams[s];
++		AVCodecParametersPrefix* cp = st->codecpar;
++		if( cp->codec_type == AVMEDIA_TYPE_VIDEO && videoStream < 0 )
++		{
++			videoStream = (int)s;
++			width = cp->width;
++			height = cp->height;
++			videoCodec = GFFmpeg.avcodec_find_decoder( cp->codec_id );
++		}
++		else if( cp->codec_type == AVMEDIA_TYPE_AUDIO && audioStream < 0 )
++		{
++			audioStream = (int)s;
++			audioCodec = GFFmpeg.avcodec_find_decoder( cp->codec_id );
++		}
++	}
++
++	if( videoStream < 0 || !videoCodec || width <= 0 || height <= 0 )
++	{
++		debugf( TEXT("[Movie] No decodable video stream") );
++		GFFmpeg.avformat_close_input( &fmtCtx );
++		return;
++	}
++
++	AVCodecContext* codecCtx = GFFmpeg.avcodec_alloc_context3( videoCodec );
++	rc = GFFmpeg.avcodec_parameters_to_context( codecCtx,
++		((AVStreamPrefix*)fc->streams[videoStream])->codecpar );
++	if( rc >= 0 )
++		rc = GFFmpeg.avcodec_open2( codecCtx, videoCodec, NULL );
++	if( rc < 0 )
++	{
++		debugf( TEXT("[Movie] codec open failed: %d"), rc );
++		GFFmpeg.avcodec_free_context( &codecCtx );
++		GFFmpeg.avformat_close_input( &fmtCtx );
++		return;
++	}
++
++	// Audio codec setup -- separate context, optional. If anything fails
++	// we just play the cutscene silent.
++	AVCodecContext* audioCtx = NULL;
++	if( audioStream >= 0 && audioCodec && GFFmpeg.bAudioLoaded )
++	{
++		audioCtx = GFFmpeg.avcodec_alloc_context3( audioCodec );
++		int arc = GFFmpeg.avcodec_parameters_to_context( audioCtx,
++			((AVStreamPrefix*)fc->streams[audioStream])->codecpar );
++		if( arc >= 0 )
++			arc = GFFmpeg.avcodec_open2( audioCtx, audioCodec, NULL );
++		if( arc < 0 )
++		{
++			debugf( TEXT("[Movie] audio codec open failed: %d (silent playback)"), arc );
++			GFFmpeg.avcodec_free_context( &audioCtx );
++			audioCtx = NULL;
++		}
++	}
++
++	// sws scaler: YUV420p -> BGRA. Same destination size as source so the
++	// quad renderer doesn't have to handle scaling -- the fullscreen quad
++	// stretches the texture to the backbuffer.
++	SwsContext* sws = GFFmpeg.sws_getContext(
++		width, height, AV_PIX_FMT_YUV420P,
++		width, height, AV_PIX_FMT_BGRA,
++		SWS_BILINEAR, NULL, NULL, NULL );
++	if( !sws )
++	{
++		debugf( TEXT("[Movie] sws_getContext failed") );
++		GFFmpeg.avcodec_free_context( &codecCtx );
++		GFFmpeg.avformat_close_input( &fmtCtx );
++		return;
++	}
++
++	// D3D8 dynamic texture matching the video frame.
++	IDirect3DTexture8* Tex = NULL;
++	if( FAILED( Device->CreateTexture( width, height, 1,
++		D3DUSAGE_DYNAMIC, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &Tex ) ) )
++	{
++		debugf( TEXT("[Movie] CreateTexture failed") );
++		GFFmpeg.sws_freeContext( sws );
++		GFFmpeg.avcodec_free_context( &codecCtx );
++		GFFmpeg.avformat_close_input( &fmtCtx );
++		return;
++	}
++
++	// Backbuffer dims for the fullscreen quad.
++	const FLOAT bbW = (FLOAT)Viewport->SizeX;
++	const FLOAT bbH = (FLOAT)Viewport->SizeY;
++
++	// Letterbox the 4:3 video into the wider backbuffer. Fit by height.
++	const FLOAT videoAR = (FLOAT)width / (FLOAT)height;
++	FLOAT drawW = bbH * videoAR;
++	FLOAT drawH = bbH;
++	if( drawW > bbW ) { drawW = bbW; drawH = bbW / videoAR; }
++	const FLOAT drawX = (bbW - drawW) * 0.5f;
++	const FLOAT drawY = (bbH - drawH) * 0.5f;
++
++	// Pre-transformed quad. -0.5 pixel offset for D3D8 texel-pixel alignment.
++	MovieVertex Quad[4];
++	Quad[0].x = drawX - 0.5f;        Quad[0].y = drawY - 0.5f;        Quad[0].z = 0.f; Quad[0].rhw = 1.f; Quad[0].u = 0.f; Quad[0].v = 0.f;
++	Quad[1].x = drawX + drawW - 0.5f; Quad[1].y = drawY - 0.5f;        Quad[1].z = 0.f; Quad[1].rhw = 1.f; Quad[1].u = 1.f; Quad[1].v = 0.f;
++	Quad[2].x = drawX - 0.5f;        Quad[2].y = drawY + drawH - 0.5f; Quad[2].z = 0.f; Quad[2].rhw = 1.f; Quad[2].u = 0.f; Quad[2].v = 1.f;
++	Quad[3].x = drawX + drawW - 0.5f; Quad[3].y = drawY + drawH - 0.5f; Quad[3].z = 0.f; Quad[3].rhw = 1.f; Quad[3].u = 1.f; Quad[3].v = 1.f;
++
++	debugf( TEXT("[Movie] Playing %s (%dx%d -> %.0fx%.0f at %.0f,%.0f)"),
++		MoviePath, width, height, drawW, drawH, drawX, drawY );
++
++	// Make sure we're rendering to the full backbuffer, not whatever
++	// pillarbox / sub-viewport the engine had active. Pre-transformed
++	// vertices are clipped to the active D3D viewport; if that's narrower
++	// than the backbuffer the movie gets clipped on the sides.
++	{
++		D3DVIEWPORT8 vp;
++		vp.X = 0;
++		vp.Y = 0;
++		vp.Width  = (DWORD)bbW;
++		vp.Height = (DWORD)bbH;
++		vp.MinZ = 0.0f;
++		vp.MaxZ = 1.0f;
++		Device->SetViewport( &vp );
++	}
++
++	AVPacket* pkt = GFFmpeg.av_packet_alloc();
++	AVFrame*  frm = GFFmpeg.av_frame_alloc();
++	AVFrame*  afrm = audioCtx ? GFFmpeg.av_frame_alloc() : NULL;
++
++	// OpenAL streaming source: 8 buffers cycled in a queue. Per audio
++	// AVFrame: pull a free buffer (unqueue if all in flight), upload
++	// PCM, queue. Source plays continuously; if it underruns we restart.
++	const ALsizei kAudioBufferCount = 8;
++	ALuint alSource = 0;
++	ALuint alBuffers[kAudioBufferCount] = {0};
++	ALuint alFreeBuffers[kAudioBufferCount] = {0};
++	int    alFreeCount = 0;
++	UBOOL  bAudioStarted = FALSE;
++	if( audioCtx )
++	{
++		GFFmpeg.alGenSources( 1, &alSource );
++		GFFmpeg.alGenBuffers( kAudioBufferCount, alBuffers );
++		for( int b = 0; b < kAudioBufferCount; b++ )
++			alFreeBuffers[ alFreeCount++ ] = alBuffers[b];
++
++		// Apply the user's music-volume slider to this source so the
++		// cutscene tracks the same control as in-game music.
++		float gain = 1.0f;
++		if( GFFmpeg.UCMovieGetCategoryVolume )
++			gain = GFFmpeg.UCMovieGetCategoryVolume( MOVIE_VOLUME_CATEGORY );
++		if( GFFmpeg.alSourcef )
++			GFFmpeg.alSourcef( alSource, AL_GAIN, gain );
++	}
++
++	// Pause the engine's music + in-flight SFX so the cutscene's own audio
++	// track is audible. Resumed in cleanup at function end. In-game video
++	// textures (loading screens, UI overlays) deliberately don't call this.
++	if( GFFmpeg.UCMovieAudioDuck )
++		GFFmpeg.UCMovieAudioDuck( 1 );
++
++	UBOOL bSkipped = FALSE;
++	int displayed = 0;
++	const DWORD startTick = GetTickCount();
++
++	// UC2 cutscenes are 30fps. Pace presentation accordingly. Sleep until
++	// the target wallclock time of frame N to avoid drift, rather than a
++	// fixed sleep per frame.
++	const DWORD frameMs = 33;  // ~30fps
++
++	// Scratch buffer for interleaved s16 PCM (worst case ~1 sec at 44.1kHz
++	// stereo -- audio packets in our XMVs deliver ~1024 samples each so a
++	// 64KB scratch is plenty).
++	const int kPcmScratchBytes = 64 * 1024;
++	av_uint8* pcmScratch = (av_uint8*)appMalloc( kPcmScratchBytes, TEXT("MoviePcm") );
++
++	while( !bSkipped && GFFmpeg.av_read_frame( fmtCtx, pkt ) == 0 )
++	{
++		AVPacketPrefix* pp = (AVPacketPrefix*)pkt;
++
++		// Audio: decode + queue to OpenAL streaming source.
++		if( audioCtx && pp->stream_index == audioStream )
++		{
++			if( GFFmpeg.avcodec_send_packet( audioCtx, pkt ) == 0 )
++			{
++				while( GFFmpeg.avcodec_receive_frame( audioCtx, afrm ) == 0 )
++				{
++					AVFrameLayout* af = (AVFrameLayout*)afrm;
++					const int nb = af->nb_samples;
++					const int fmt = af->format;
++					// AVFrame->sample_rate sits past AVChannelLayout (which
++					// in turn sits after a chain of enums and rationals)
++					// and the layout differs by FFmpeg version. UC2's
++					// cutscenes are all 44.1 kHz stereo per ffprobe; hardcode
++					// rather than struct-walk for now. Gate on AVCodecContext
++					// later if non-44.1 content shows up.
++					const int sr = 44100;
++					// All UC2 cutscene audio is stereo. Inferring channels
++					// from data[1]!=NULL only worked for planar formats --
++					// interleaved S16 (e.g. UC2_Logos.xmv's pcm_s16le)
++					// keeps everything in data[0] and data[1] is NULL,
++					// which made us mis-size the buffer and queue it as
++					// MONO16 instead of STEREO16. Hardcoded for now;
++					// proper channel count would come from the codec
++					// context's AVChannelLayout at codec-open time.
++					const int channels = 2;
++
++					// Reclaim any processed buffers before allocating a new one.
++					if( alFreeCount == 0 )
++					{
++						ALint processed = 0;
++						GFFmpeg.alGetSourcei( alSource, AL_BUFFERS_PROCESSED, &processed );
++						if( processed > 0 )
++						{
++							ALuint reclaimed[kAudioBufferCount];
++							GFFmpeg.alSourceUnqueueBuffers( alSource, processed, reclaimed );
++							for( int i = 0; i < processed; i++ )
++								alFreeBuffers[ alFreeCount++ ] = reclaimed[i];
++						}
++					}
++					if( alFreeCount == 0 )
++						continue;  // queue is saturated; drop this chunk
++
++					ALuint buf = alFreeBuffers[ --alFreeCount ];
++
++					const int outBytes = nb * channels * 2;
++					if( outBytes > kPcmScratchBytes )
++						continue;
++
++					if( fmt == AV_SAMPLE_FMT_S16P && channels == 2 )
++					{
++						// planar -> interleaved
++						av_int16* L = (av_int16*)af->data[0];
++						av_int16* R = (av_int16*)af->data[1];
++						av_int16* o = (av_int16*)pcmScratch;
++						for( int i = 0; i < nb; i++ )
++						{
++							o[i*2  ] = L[i];
++							o[i*2+1] = R[i];
++						}
++					}
++					else if( fmt == AV_SAMPLE_FMT_S16P && channels == 1 )
++					{
++						appMemcpy( pcmScratch, af->data[0], outBytes );
++					}
++					else if( fmt == AV_SAMPLE_FMT_S16 )
++					{
++						appMemcpy( pcmScratch, af->data[0], outBytes );
++					}
++					else
++					{
++						continue;  // unsupported format
++					}
++
++					ALenum alFormat = ( channels == 2 ) ? AL_FORMAT_STEREO16 : AL_FORMAT_MONO16;
++					GFFmpeg.alBufferData( buf, alFormat, pcmScratch, outBytes, sr );
++					GFFmpeg.alSourceQueueBuffers( alSource, 1, &buf );
++
++					if( !bAudioStarted )
++					{
++						GFFmpeg.alSourcePlay( alSource );
++						bAudioStarted = TRUE;
++					}
++					else
++					{
++						// Restart if we've underrun.
++						ALint state = 0;
++						GFFmpeg.alGetSourcei( alSource, AL_SOURCE_STATE, &state );
++						if( state != AL_PLAYING )
++							GFFmpeg.alSourcePlay( alSource );
++					}
++				}
++			}
++			GFFmpeg.av_packet_unref( pkt );
++			continue;
++		}
++
++		// Skip packets from streams we're not handling.
++		if( pp->stream_index != videoStream )
++		{
++			GFFmpeg.av_packet_unref( pkt );
++			continue;
++		}
++
++		rc = GFFmpeg.avcodec_send_packet( codecCtx, pkt );
++		if( rc == 0 )
++		{
++			while( !bSkipped && GFFmpeg.avcodec_receive_frame( codecCtx, frm ) == 0 )
++			{
++				AVFrameLayout* fr = (AVFrameLayout*)frm;
++
++				// Lock the dynamic texture; sws_scale writes BGRA directly into the locked surface.
++				D3DLOCKED_RECT lr;
++				if( SUCCEEDED( Tex->LockRect( 0, &lr, NULL, D3DLOCK_DISCARD ) ) )
++				{
++					av_uint8* dstPlanes[4] = { (av_uint8*)lr.pBits, NULL, NULL, NULL };
++					int dstStrides[4] = { lr.Pitch, 0, 0, 0 };
++					GFFmpeg.sws_scale( sws,
++						(const av_uint8* const*)fr->data, fr->linesize,
++						0, height, dstPlanes, dstStrides );
++					Tex->UnlockRect( 0 );
++				}
++
++				// Render: clear, set state, draw quad, present.
++				Device->BeginScene();
++				Device->Clear( 0, NULL, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0,0,0), 1.0f, 0 );
++				Device->SetTexture( 0, Tex );
++				Device->SetVertexShader( MOVIE_FVF );
++				Device->SetTextureStageState( 0, D3DTSS_COLOROP,   D3DTOP_SELECTARG1 );
++				Device->SetTextureStageState( 0, D3DTSS_COLORARG1, D3DTA_TEXTURE );
++				Device->SetTextureStageState( 0, D3DTSS_ALPHAOP,   D3DTOP_SELECTARG1 );
++				Device->SetTextureStageState( 0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE );
++				Device->SetTextureStageState( 0, D3DTSS_MINFILTER, D3DTEXF_LINEAR );
++				Device->SetTextureStageState( 0, D3DTSS_MAGFILTER, D3DTEXF_LINEAR );
++				Device->SetRenderState( D3DRS_ZENABLE,         FALSE );
++				Device->SetRenderState( D3DRS_LIGHTING,        FALSE );
++				Device->SetRenderState( D3DRS_CULLMODE,        D3DCULL_NONE );
++				Device->SetRenderState( D3DRS_ALPHABLENDENABLE,FALSE );
++				Device->DrawPrimitiveUP( D3DPT_TRIANGLESTRIP, 2, Quad, sizeof(MovieVertex) );
++				Device->SetTexture( 0, NULL );
++				Device->EndScene();
++				Device->Present( NULL, NULL, NULL, NULL );
++
++				displayed++;
++
++				// Pace at the source framerate. Target time of this frame is
++				// startTick + displayed*frameMs; sleep until then.
++				const DWORD targetTick = startTick + (DWORD)displayed * frameMs;
++				const DWORD now = GetTickCount();
++				if( targetTick > now )
++					Sleep( targetTick - now );
++
++				bSkipped = PumpAndCheckSkip();
++			}
++		}
++		GFFmpeg.av_packet_unref( pkt );
++		if( !bSkipped )
++			bSkipped = PumpAndCheckSkip();
++	}
++
++	const DWORD elapsedMs = GetTickCount() - startTick;
++	debugf( TEXT("[Movie] %s : displayed %d frames in %u ms (%s)"),
++		MoviePath, displayed, elapsedMs, bSkipped ? TEXT("skipped") : TEXT("ended") );
++
++	if( Tex ) Tex->Release();
++	GFFmpeg.sws_freeContext( sws );
++
++	if( audioCtx )
++	{
++		if( alSource )
++		{
++			GFFmpeg.alSourceStop( alSource );
++			GFFmpeg.alDeleteSources( 1, &alSource );
++		}
++		GFFmpeg.alDeleteBuffers( kAudioBufferCount, alBuffers );
++		GFFmpeg.avcodec_free_context( &audioCtx );
++	}
++	if( afrm ) GFFmpeg.av_frame_free( &afrm );
++
++	if( pcmScratch ) appFree( pcmScratch );
++
++	GFFmpeg.av_frame_free( &frm );
++	GFFmpeg.av_packet_free( &pkt );
++	GFFmpeg.avcodec_free_context( &codecCtx );
++	GFFmpeg.avformat_close_input( &fmtCtx );
++
++	// Resume the engine's audio (paused in the duck call above).
++	if( GFFmpeg.UCMovieAudioDuck )
++		GFFmpeg.UCMovieAudioDuck( 0 );
++}
++
++// ---------------------------------------------------------------------------
++// FFFmpegMovieMaterialDecoder
++//
++// Long-lived per-UMovieMaterial decoder for in-engine video textures
++// (loading screens, menu portraits, anything that uses the MovieMaterial
++// script class). Different lifecycle from the fullscreen cutscene path:
++// open once when first sampled, decode one frame per game tick (paced by
++// wallclock), lives on the UMovieMaterial via its MovieDecoder slot until
++// UMovieMaterial::Dispose tears us down.
++//
++// Buffer-output design: the decoder produces a CPU BGRA buffer, never an
++// IDirect3DTexture8. Cross-DLL contract with engine's FMovieTexture:
++//
++//   UCMovieMaterialPump(pMat, &rev, &w, &h)
++//       Lazy-creates the decoder, advances one frame iff the wallclock
++//       says it's time. Returns 1 on success (rev/w/h filled) or 0 on
++//       open failure (caller falls back to LoadingFallback). On every
++//       successful decode bumps pMat->LastD3DTexture (repurposed as the
++//       revision counter on PC) and writes pMat->USize/VSize so the
++//       engine's FMovieTexture::GetWidth/Height pick up the dims.
++//
++//   UCMovieMaterialCopy(pMat, Dest, DestStride)
++//       Engine-cache callback: memcpy the latest BGRA frame into the
++//       D3D-locked surface. Width is taken from pMat->USize so we work
++//       even if Dest is a power-of-two-rounded surface.
++//
++//   UCMovieMaterialDispose(pMat)
++//       Free decoder + buffer, zero pMat->MovieDecoder. Called from
++//       UMovieMaterial::Dispose.
++//
++// The pixel format is BGRA byte order in memory (== D3DFMT_A8R8G8B8 on
++// little-endian, which is what the engine cache allocates for TEXF_RGBA8).
++// ---------------------------------------------------------------------------
++
++class FFFmpegMovieMaterialDecoder : public FMoviePlayer
++{
++public:
++	FFFmpegMovieMaterialDecoder()
++		: fmtCtx(NULL), codecCtx(NULL), sws(NULL),
++		  pkt(NULL), frm(NULL),
++		  videoStream(-1), Width(0), Height(0),
++		  Buffer(NULL), BufferBytes(0),
++		  bAtEnd(FALSE), bLooping(FALSE),
++		  StartTick(0), DeliveredFrames(0), FrameMs(33),
++		  Revision(0)
++	{}
++
++	virtual ~FFFmpegMovieMaterialDecoder()
++	{
++		Close();
++	}
++
++	UBOOL Open( const TCHAR* FilePath, UBOOL bInLooping )
++	{
++		// Re-arm per-stream state. Open is called both initially and after
++		// Close() on the bReset / loop-restart paths; without these resets
++		// the stream-find loop below would skip and leave codecCtx/sws unset.
++		bLooping = bInLooping;
++		videoStream = -1;
++		Width = 0;
++		Height = 0;
++		bAtEnd = FALSE;
++		MoviePath = FilePath;
++		StartTick = GetTickCount();
++		DeliveredFrames = 0;
++
++		if( !FFmpegLoad() )
++			return FALSE;
++
++		// TCHAR -> ANSI for FFmpeg's url param.
++		char AnsiPath[1024];
++		const TCHAR* Src = FilePath;
++		int i = 0;
++		while( *Src && i < (int)sizeof(AnsiPath)-1 )
++			AnsiPath[i++] = (char)*Src++;
++		AnsiPath[i] = 0;
++
++		int rc = GFFmpeg.avformat_open_input( &fmtCtx, AnsiPath, NULL, NULL );
++		if( rc != 0 )
++			return FALSE;
++
++		rc = GFFmpeg.avformat_find_stream_info( fmtCtx, NULL );
++		if( rc < 0 )
++			return FALSE;
++
++		AVFormatContextPrefix* fc = (AVFormatContextPrefix*)fmtCtx;
++		const AVCodec* videoCodec = NULL;
++		for( unsigned int s = 0; s < fc->nb_streams; s++ )
++		{
++			AVStreamPrefix* st = (AVStreamPrefix*)fc->streams[s];
++			AVCodecParametersPrefix* cp = st->codecpar;
++			if( cp->codec_type == AVMEDIA_TYPE_VIDEO && videoStream < 0 )
++			{
++				videoStream = (int)s;
++				Width = cp->width;
++				Height = cp->height;
++				videoCodec = GFFmpeg.avcodec_find_decoder( cp->codec_id );
++			}
++		}
++		if( videoStream < 0 || !videoCodec || Width <= 0 || Height <= 0 )
++			return FALSE;
++
++		codecCtx = GFFmpeg.avcodec_alloc_context3( videoCodec );
++		rc = GFFmpeg.avcodec_parameters_to_context( codecCtx,
++			((AVStreamPrefix*)fc->streams[videoStream])->codecpar );
++		if( rc >= 0 )
++			rc = GFFmpeg.avcodec_open2( codecCtx, videoCodec, NULL );
++		if( rc < 0 )
++			return FALSE;
++
++		sws = GFFmpeg.sws_getContext(
++			Width, Height, AV_PIX_FMT_YUV420P,
++			Width, Height, AV_PIX_FMT_BGRA,
++			SWS_BILINEAR, NULL, NULL, NULL );
++		if( !sws )
++			return FALSE;
++
++		BufferBytes = Width * Height * 4;
++		Buffer = (av_uint8*)appMalloc( BufferBytes, TEXT("FFFmpegMovieMaterialDecoder") );
++		// Black-fill so the first GetTextureData call before any frame has
++		// been decoded shows opaque black instead of uninitialised memory.
++		for( INT b = 0; b < BufferBytes; b += 4 )
++		{
++			Buffer[b+0] = 0; Buffer[b+1] = 0; Buffer[b+2] = 0; Buffer[b+3] = 0xFF;
++		}
++
++		pkt = GFFmpeg.av_packet_alloc();
++		frm = GFFmpeg.av_frame_alloc();
++		return TRUE;
++	}
++
++	void Close()
++	{
++		if( Buffer )    { appFree( Buffer ); Buffer = NULL; BufferBytes = 0; }
++		if( sws )       { GFFmpeg.sws_freeContext( sws ); sws = NULL; }
++		if( frm )       { GFFmpeg.av_frame_free( &frm ); }
++		if( pkt )       { GFFmpeg.av_packet_free( &pkt ); }
++		if( codecCtx )  { GFFmpeg.avcodec_free_context( &codecCtx ); }
++		if( fmtCtx )    { GFFmpeg.avformat_close_input( &fmtCtx ); }
++	}
++
++	UBOOL Restart()
++	{
++		FString Path = MoviePath;
++		UBOOL bLoop = bLooping;
++		Close();
++		return Open( *Path, bLoop );
++	}
++
++	// Decode the next video frame into Buffer if it's time. Returns TRUE
++	// iff a new frame was produced (in which case Revision is bumped).
++	UBOOL AdvanceFrame()
++	{
++		if( !pkt || !frm || !Buffer || !codecCtx )
++			return FALSE;
++		if( bAtEnd )
++			return FALSE;
++
++		const DWORD now = GetTickCount();
++		if( DeliveredFrames > 0 &&
++			(INT)(now - StartTick) < DeliveredFrames * FrameMs )
++			return FALSE;  // not time for next frame yet
++
++		// Read until we get a video frame or hit EOF.
++		while( TRUE )
++		{
++			int rc = GFFmpeg.av_read_frame( fmtCtx, pkt );
++			if( rc < 0 )
++			{
++				// EOF: try to flush the decoder for any buffered frames.
++				GFFmpeg.avcodec_send_packet( codecCtx, NULL );
++				if( GFFmpeg.avcodec_receive_frame( codecCtx, frm ) == 0 )
++					break;
++				bAtEnd = TRUE;
++				return FALSE;
++			}
++
++			AVPacketPrefix* pp = (AVPacketPrefix*)pkt;
++			if( pp->stream_index != videoStream )
++			{
++				GFFmpeg.av_packet_unref( pkt );
++				continue;
++			}
++
++			rc = GFFmpeg.avcodec_send_packet( codecCtx, pkt );
++			GFFmpeg.av_packet_unref( pkt );
++			if( rc != 0 )
++				continue;
++			if( GFFmpeg.avcodec_receive_frame( codecCtx, frm ) == 0 )
++				break;
++			// Codec needs more data; loop.
++		}
++
++		// Convert YUV420P -> BGRA into Buffer.
++		AVFrameLayout* fr = (AVFrameLayout*)frm;
++		av_uint8* dstPlanes[4]  = { Buffer, NULL, NULL, NULL };
++		int       dstStrides[4] = { Width * 4, 0, 0, 0 };
++		GFFmpeg.sws_scale( sws,
++			(const av_uint8* const*)fr->data, fr->linesize,
++			0, Height, dstPlanes, dstStrides );
++
++		DeliveredFrames++;
++		Revision++;
++		return TRUE;
++	}
++
++	// State accessors for the export shims.
++	int   GetWidth()    const { return Width; }
++	int   GetHeight()   const { return Height; }
++	int   GetRevision() const { return Revision; }
++	UBOOL IsAtEnd()     const { return bAtEnd; }
++
++	// memcpy current Buffer into Dest at DestStride. Buffer is BGRA at
++	// Width*4 stride; Dest is whatever the cache locked (DestStride may be
++	// >= Width*4 for power-of-two-rounded surfaces).
++	void CopyToSurface( void* Dest, int DestStride )
++	{
++		if( !Buffer || Width <= 0 || Height <= 0 || !Dest )
++			return;
++		const int rowBytes = Width * 4;
++		for( int y = 0; y < Height; y++ )
++		{
++			BYTE* dstRow = (BYTE*)Dest + y * DestStride;
++			BYTE* srcRow = Buffer + y * rowBytes;
++			appMemcpy( dstRow, srcRow, rowBytes );
++		}
++	}
++
++private:
++	AVFormatContext*    fmtCtx;
++	AVCodecContext*     codecCtx;
++	SwsContext*         sws;
++	AVPacket*           pkt;
++	AVFrame*            frm;
++	int                 videoStream;
++	int                 Width, Height;
++	av_uint8*           Buffer;
++	INT                 BufferBytes;
++	UBOOL               bAtEnd;
++	UBOOL               bLooping;
++	FString             MoviePath;
++	DWORD               StartTick;
++	INT                 DeliveredFrames;
++	INT                 FrameMs;
++	INT                 Revision;
++};
++
++// Normalise the script-side MovieFileName to a path FFmpeg can open.
++// UC2's MovieMaterial assets store Xbox absolute paths like
++// D:\Textures\Movies\Foo.xmv -- translate the D:\ prefix to ..\ so we
++// hit UC2004/Textures/Movies/Foo.xmv from System/. Bare names like
++// "UC2_Logos" fall back to ..\Movies\.
++static FString NormalizeMoviePath( const FString& In )
++{
++	FString p = In;
++	if( p.Left(3) == TEXT("D:\\") || p.Left(3) == TEXT("d:\\") ||
++		p.Left(3) == TEXT("D:/")  || p.Left(3) == TEXT("d:/") )
++		p = FString(TEXT("..\\")) + p.Mid(3);
++	else if( p.InStr( TEXT("\\") ) < 0 && p.InStr( TEXT("/") ) < 0 )
++		p = FString(TEXT("..\\Movies\\")) + p;
++	if( p.InStr( TEXT(".") ) < 0 )
++		p = p + TEXT(".xmv");
++	return p;
++}
++
++// ---------------------------------------------------------------------------
++// Cross-DLL exports for engine-side FMovieTexture. Mirrors UCMovieAudioDuck
++// shape: extern "C" __declspec(dllexport), found via GetProcAddress in
++// Engine.dll. See UC2004/Engine/Src/UnMaterial.cpp ResolveMovieMaterialAPI.
++// ---------------------------------------------------------------------------
++
++// Pump: open decoder if absent; advance one frame if wallclock says it's time.
++// Writes pMat->USize/VSize and bumps pMat->LastD3DTexture (repurposed as the
++// revision counter on PC) on every successful decode.
++//
++// Returns 1 if the decoder is healthy (rev/w/h filled), 0 if open failed and
++// the caller should dispatch to LoadingFallback / DefaultMaterial.
++extern "C" __declspec(dllexport) int UCMovieMaterialPump(
++	UMovieMaterial* pMat, int* outRev, int* outW, int* outH )
++{
++	if( !pMat || pMat->bHasError )
++		return 0;
++	if( !FFmpegLoad() )
++	{
++		pMat->bHasError = 1;
++		return 0;
++	}
++
++	FFFmpegMovieMaterialDecoder* dec =
++		(FFFmpegMovieMaterialDecoder*)pMat->MovieDecoder;
++
++	if( !dec )
++	{
++		dec = new FFFmpegMovieMaterialDecoder();
++		FString Path = NormalizeMoviePath( pMat->MovieFileName );
++		if( !dec->Open( *Path, pMat->bPlayLooping ) )
++		{
++			debugf( TEXT("[MovieMat] open failed: %s (raw=%s)"),
++				*Path, *pMat->MovieFileName );
++			delete dec;
++			pMat->bHasError = 1;
++			return 0;
++		}
++		pMat->MovieDecoder = (INT)dec;
++		pMat->USize = dec->GetWidth();
++		pMat->VSize = dec->GetHeight();
++		// First-frame revision starts at 0; cache compares against its
++		// stored revision so even 0 triggers an upload on first use.
++		pMat->LastD3DTexture = dec->GetRevision();
++	}
++
++	if( pMat->bReset )
++	{
++		if( !dec->Restart() )
++		{
++			delete dec;
++			pMat->MovieDecoder = 0;
++			pMat->bHasError = 1;
++			pMat->bReset = 0;
++			return 0;
++		}
++		pMat->USize = dec->GetWidth();
++		pMat->VSize = dec->GetHeight();
++		pMat->bReset = 0;
++	}
++
++	UBOOL bAdvanced = dec->AdvanceFrame();
++
++	if( dec->IsAtEnd() )
++	{
++		if( pMat->bPlayLooping )
++		{
++			if( !dec->Restart() )
++			{
++				delete dec;
++				pMat->MovieDecoder = 0;
++				pMat->bHasError = 1;
++				return 0;
++			}
++		}
++		else if( OBJ_DELEGATE_IS_SET(pMat,OnDonePlaying) )
++		{
++			pMat->delegateOnDonePlaying();
++		}
++	}
++
++	if( bAdvanced )
++		pMat->LastD3DTexture = dec->GetRevision();
++
++	if( outRev ) *outRev = dec->GetRevision();
++	if( outW )   *outW   = dec->GetWidth();
++	if( outH )   *outH   = dec->GetHeight();
++	return 1;
++}
++
++extern "C" __declspec(dllexport) void UCMovieMaterialCopy(
++	UMovieMaterial* pMat, void* Dest, int DestStride )
++{
++	if( !pMat || !Dest )
++		return;
++	FFFmpegMovieMaterialDecoder* dec =
++		(FFFmpegMovieMaterialDecoder*)pMat->MovieDecoder;
++	if( !dec )
++		return;
++	dec->CopyToSurface( Dest, DestStride );
++}
++
++extern "C" __declspec(dllexport) void UCMovieMaterialDispose(
++	UMovieMaterial* pMat )
++{
++	if( !pMat )
++		return;
++	FFFmpegMovieMaterialDecoder* dec =
++		(FFFmpegMovieMaterialDecoder*)pMat->MovieDecoder;
++	if( dec )
++	{
++		delete dec;
++		pMat->MovieDecoder = 0;
++	}
++}
++
++// ---------------------------------------------------------------------------
++// PC implementation of the engine's movie entry points. The Xbox versions
++// live in UC2004/XboxDrv/Src/XboxMovieThread.cpp; here we provide PC
++// equivalents so the engine's #ifdef _XBOX wraps can be removed.
++//
++// First cut: PlayIntroCinematic and PlayOutroCinematic decode-log only.
++// PlayLoadingMovie / CreateLoadingMovie / SetEngineReady are stubs (loading
++// movies are async and require threading -- follow-up).
++// ---------------------------------------------------------------------------
++
++class WinMovieThread : public FMovieThread
++{
++public:
++	virtual void Exit(void) {}
++};
++
++extern "C"
++{
++
++D3DDRV_API UBOOL IsPlayingMovie( void )
++{
++	return GMoviePlaying;
++}
++
++D3DDRV_API void SetEngineReady( void )
++{
++	// Xbox: signal that the loading-movie thread can stop. PC: no-op for now
++	// because we don't have an async loading-movie thread yet.
++}
++
++D3DDRV_API FMovieThread* CreateLoadingMovie(
++	const FURL& /*URL*/, const TCHAR* /*URLOpt*/,
++	UBOOL /*bWaitForComplete*/, UBOOL /*bUseDefault*/ )
++{
++	// Stub. Loading movies are async; first cut runs only modal cinematics.
++	return new WinMovieThread();
++}
++
++D3DDRV_API void PlayLoadingMovie( const FURL& /*URL*/, UBOOL /*bSinglePlayer*/ )
++{
++	// Stub. See CreateLoadingMovie.
++}
++
++static void PlayCinematicByOption( const FURL& URL, const TCHAR* OptionName )
++{
++	const TCHAR* MovieName = URL.GetOption( OptionName, NULL );
++	if( !MovieName || !*MovieName )
++		return;
++
++	// UC2 stores movies under Movies/<name>.xmv
++	FString Path = FString::Printf( TEXT("..\\Movies\\%s.xmv"), MovieName );
++
++	GMoviePlaying = TRUE;
++	DecodeMovieFile( *Path );
++	GMoviePlaying = FALSE;
++}
++
++D3DDRV_API void PlayIntroCinematic( const FURL& URL )
++{
++	PlayCinematicByOption( URL, TEXT("StartCinematic") );
++}
++
++D3DDRV_API void PlayOutroCinematic( const FURL& URL )
++{
++	PlayCinematicByOption( URL, TEXT("EndCinematic") );
++}
++
++} // extern "C"
++
++/*-----------------------------------------------------------------------------
++	The End.
++-----------------------------------------------------------------------------*/

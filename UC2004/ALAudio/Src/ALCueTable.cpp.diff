@@ -1,0 +1,402 @@
+diff --git a/UC2004/ALAudio/Src/ALCueTable.cpp b/UC2004/ALAudio/Src/ALCueTable.cpp
+new file mode 100644
+index 00000000..659ae245
+--- /dev/null
++++ b/UC2004/ALAudio/Src/ALCueTable.cpp
+@@ -0,0 +1,396 @@
++/*=============================================================================
++	ALCueTable.cpp: Avaris.xap parser -> TMap<FName, FCueDef>.
++
++	Parses the XACT project text (curly-brace blocks with `Key = Value;`
++	lines and nested blocks) in a single forward pass. Builds three
++	intermediate maps: wave entries by (bank|entry) string key, sounds by
++	name, cues by name, then joins them into the cue table.
++=============================================================================*/
++
++#include "ALAudioPrivate.h"
++#include "ALCueTable.h"
++
++namespace
++{
++	// Wave entry record: file path + audio format. File path is stored
++	// verbatim from the .xap (e.g. "..\\SoundData\\A_Announcer\\Adrenaline.wav"),
++	// resolvable as-is when the runtime CWD is System/.
++	struct FWaveEntry
++	{
++		FString File;
++		INT     Channels;
++		INT     SamplingRate;
++		INT     BitsPerSample;
++	};
++
++	// First Registered Wave reference inside a Sound block.
++	struct FWaveRef
++	{
++		FString WaveBank;
++		FString WaveEntry;
++	};
++
++	// Sound metadata (the cue's mixer params come from here).
++	struct FSoundDef
++	{
++		FString  Name;
++		BYTE     Category;
++		INT      VolumeMillibel;
++		INT      Priority;
++		FWaveRef FirstWave;
++		UBOOL    HasWave;
++		// Pitch envelope from "Pitch and Filter EG" block under Track.
++		UBOOL    HasPitchEG;
++		INT      EG_Delay;
++		INT      EG_Attack;
++		INT      EG_Hold;
++		INT      EG_Decay;
++		INT      EG_Sustain;
++		INT      EG_Release;
++		INT      PitchScaleCents;
++	};
++
++	// Trim whitespace (in place).
++	void TrimRight( FString& S )
++	{
++		while( S.Len() > 0 && (S.Right(1) == TEXT(" ") || S.Right(1) == TEXT("\t") || S.Right(1) == TEXT("\r")) )
++			S = S.Left( S.Len() - 1 );
++	}
++	void TrimLeft( FString& S )
++	{
++		INT N = 0;
++		while( N < S.Len() && (S.Mid(N,1) == TEXT(" ") || S.Mid(N,1) == TEXT("\t")) )
++			N++;
++		if( N > 0 )
++			S = S.Right( S.Len() - N );
++	}
++	void Trim( FString& S ) { TrimLeft(S); TrimRight(S); }
++
++	// Split "Key = Value;" -> (key, value). Returns 0 if not an assignment line.
++	UBOOL ParseAssignment( const FString& Line, FString& OutKey, FString& OutValue )
++	{
++		INT EqPos = Line.InStr( TEXT("=") );
++		if( EqPos < 0 ) return 0;
++		INT Stop = Line.Len();
++		if( Stop > 0 && Line.Right(1) == TEXT(";") )
++			Stop--;
++		OutKey   = Line.Left( EqPos );
++		OutValue = Line.Mid( EqPos + 1, Stop - EqPos - 1 );
++		Trim( OutKey );
++		Trim( OutValue );
++		return 1;
++	}
++
++	BYTE CategoryFromString( const FString& S )
++	{
++		if( S == TEXT("Music") )     return UAudioSubsystem::VOLUME_Music;
++		if( S == TEXT("Voice") )     return UAudioSubsystem::VOLUME_Voice;
++		if( S == TEXT("VoiceChat") ) return UAudioSubsystem::VOLUME_VoiceChat;
++		// "FX" and anything unrecognized maps to FX -- the safest default.
++		return UAudioSubsystem::VOLUME_FX;
++	}
++
++	// Block-stack frame.
++	enum EBlockType
++	{
++		BLK_Root = 0,
++		BLK_WaveBank,
++		BLK_WaveEntry,
++		BLK_SoundBank,
++		BLK_Sound,
++		BLK_Cue,
++		BLK_Track,                 // arbitrary container
++		BLK_Play,                  // "Play with Pitch and Volume Variation" etc.
++		BLK_RegisteredWave,
++		BLK_CueSoundRef,
++		BLK_PitchFilterEG,         // "Pitch and Filter EG" envelope under Track
++		BLK_Other,                 // Category, Variable, RPC Preset, ...
++	};
++
++	struct FBlockFrame
++	{
++		EBlockType Type;
++		FString    Name;           // current block's Name attr if set
++	};
++}
++
++// Uppercase the input in-place. Cheap stand-in for proper case folding;
++// the cue strings we're keying on are ASCII-only, so toupper-per-char
++// gives a deterministic case-insensitive key without involving FName.
++static FString UpperCopy( const FString& S )
++{
++	FString R = S;
++	for( INT i = 0; i < R.Len(); i++ )
++	{
++		TCHAR c = R[i];
++		if( c >= TEXT('a') && c <= TEXT('z') )
++			R[i] = c - TEXT('a') + TEXT('A');
++	}
++	return R;
++}
++
++INT ParseAvarisXAP( const TCHAR* AbsXapPath, TMap<FString,FCueDef>& outCues )
++{
++	guard(ParseAvarisXAP);
++
++	TArray<BYTE> Buffer;
++	if( !appLoadFileToArray( Buffer, AbsXapPath ) )
++	{
++		debugf( NAME_Init, TEXT("ALCueTable: cannot read %s"), AbsXapPath );
++		return 0;
++	}
++
++	// .xap is ANSI text. Convert into one FString and split on \n.
++	Buffer.AddItem(0);
++	FString Whole = appFromAnsi( (ANSICHAR*)&Buffer(0) );
++
++	// Three intermediate maps populated as we walk the blocks.
++	TMap<FString,FWaveEntry>  WaveEntries;   // key = "Bank|Entry"
++	TMap<FString,FSoundDef>   Sounds;        // key = sound name
++	TMap<FString,FString>     Cues;          // key = cue name, value = first sound ref
++
++	// Block stack + scratch state for each block type.
++	TArray<FBlockFrame> Stack;
++	FBlockFrame Root;
++	Root.Type = BLK_Root;
++	Stack.AddItem( Root );
++
++	EBlockType PendingType = BLK_Other;
++	FString    PendingHeader;
++
++	// Per-Wave-Bank scratch.
++	FString CurWaveBankName;
++	// Per-Wave-Entry scratch.
++	FWaveEntry CurEntry;
++	FString    CurEntryName;
++	// Per-Sound scratch.
++	FSoundDef CurSound;
++	UBOOL     SoundHasWave;
++	// Per-Cue scratch.
++	FString CurCueName;
++	FString CurCueFirstSoundRef;
++	UBOOL   CueHasSoundRef;
++
++	const INT WholeLen = Whole.Len();
++	INT Pos = 0;
++	while( Pos < WholeLen )
++	{
++		// Read one line.
++		INT LineEnd = Pos;
++		while( LineEnd < WholeLen && Whole.Mid(LineEnd,1) != TEXT("\n") )
++			LineEnd++;
++		FString Line = Whole.Mid( Pos, LineEnd - Pos );
++		Pos = LineEnd + 1;
++
++		Trim( Line );
++		if( Line.Len() == 0 )
++			continue;
++
++		// Block open.
++		if( Line == TEXT("{") )
++		{
++			FBlockFrame F;
++			F.Type = PendingType;
++			F.Name = TEXT("");
++			Stack.AddItem( F );
++
++			// Reset per-block scratch on entry.
++			if( PendingType == BLK_WaveEntry )
++			{
++				CurEntry.File = TEXT("");
++				CurEntry.Channels = 0;
++				CurEntry.SamplingRate = 0;
++				CurEntry.BitsPerSample = 0;
++				CurEntryName = TEXT("");
++			}
++			else if( PendingType == BLK_Sound )
++			{
++				CurSound.Name = TEXT("");
++				CurSound.Category = UAudioSubsystem::VOLUME_FX;
++				CurSound.VolumeMillibel = 0;
++				CurSound.Priority = 0;
++				CurSound.FirstWave.WaveBank = TEXT("");
++				CurSound.FirstWave.WaveEntry = TEXT("");
++				CurSound.HasWave = 0;
++				CurSound.HasPitchEG = 0;
++				CurSound.EG_Delay = 0;
++				CurSound.EG_Attack = 0;
++				CurSound.EG_Hold = 0;
++				CurSound.EG_Decay = 0;
++				CurSound.EG_Sustain = 100;
++				CurSound.EG_Release = 0;
++				CurSound.PitchScaleCents = 0;
++				SoundHasWave = 0;
++			}
++			else if( PendingType == BLK_Cue )
++			{
++				CurCueName = TEXT("");
++				CurCueFirstSoundRef = TEXT("");
++				CueHasSoundRef = 0;
++			}
++
++			PendingType = BLK_Other;
++			PendingHeader = TEXT("");
++			continue;
++		}
++
++		// Block close.
++		if( Line == TEXT("}") )
++		{
++			if( Stack.Num() <= 1 ) continue;
++			FBlockFrame Closed = Stack( Stack.Num() - 1 );
++			Stack.Remove( Stack.Num() - 1 );
++
++			if( Closed.Type == BLK_WaveEntry && CurEntryName.Len() > 0 )
++			{
++				FString Key = CurWaveBankName + TEXT("|") + CurEntryName;
++				WaveEntries.Set( *Key, CurEntry );
++			}
++			else if( Closed.Type == BLK_Sound && CurSound.Name.Len() > 0 )
++			{
++				CurSound.HasWave = SoundHasWave;
++				Sounds.Set( *CurSound.Name, CurSound );
++			}
++			else if( Closed.Type == BLK_Cue && CurCueName.Len() > 0 && CueHasSoundRef )
++			{
++				Cues.Set( *CurCueName, *CurCueFirstSoundRef );
++			}
++			continue;
++		}
++
++		// Assignment line.
++		FString Key, Val;
++		if( ParseAssignment( Line, Key, Val ) )
++		{
++			EBlockType Cur = Stack( Stack.Num() - 1 ).Type;
++			if( Cur == BLK_WaveBank )
++			{
++				if( Key == TEXT("Name") )
++					CurWaveBankName = Val;
++			}
++			else if( Cur == BLK_WaveEntry )
++			{
++				if( Key == TEXT("Name") )                  CurEntryName = Val;
++				else if( Key == TEXT("File") )             CurEntry.File = Val;
++				else if( Key == TEXT("Channels") )         CurEntry.Channels = appAtoi(*Val);
++				else if( Key == TEXT("Sampling Rate") )    CurEntry.SamplingRate = appAtoi(*Val);
++				else if( Key == TEXT("Bits Per Sample") )  CurEntry.BitsPerSample = appAtoi(*Val);
++			}
++			else if( Cur == BLK_Sound )
++			{
++				if( Key == TEXT("Name") )         CurSound.Name = Val;
++				else if( Key == TEXT("Category") )   CurSound.Category = CategoryFromString(Val);
++				else if( Key == TEXT("Volume") )     CurSound.VolumeMillibel = appAtoi(*Val);
++				else if( Key == TEXT("Priority") )   CurSound.Priority = appAtoi(*Val);
++			}
++			else if( Cur == BLK_PitchFilterEG )
++			{
++				if(      Key == TEXT("Delay") )       CurSound.EG_Delay   = appAtoi(*Val);
++				else if( Key == TEXT("Attack") )      CurSound.EG_Attack  = appAtoi(*Val);
++				else if( Key == TEXT("Hold") )        CurSound.EG_Hold    = appAtoi(*Val);
++				else if( Key == TEXT("Decay") )       CurSound.EG_Decay   = appAtoi(*Val);
++				else if( Key == TEXT("Sustain") )     CurSound.EG_Sustain = appAtoi(*Val);
++				else if( Key == TEXT("Release") )     CurSound.EG_Release = appAtoi(*Val);
++				else if( Key == TEXT("Pitch Scale") )
++				{
++					CurSound.PitchScaleCents = appAtoi(*Val);
++					if( CurSound.PitchScaleCents != 0 )
++						CurSound.HasPitchEG = 1;
++				}
++			}
++			else if( Cur == BLK_RegisteredWave )
++			{
++				if( !SoundHasWave )
++				{
++					if( Key == TEXT("Wave Bank") )
++						CurSound.FirstWave.WaveBank = Val;
++					else if( Key == TEXT("Wave Entry") )
++					{
++						CurSound.FirstWave.WaveEntry = Val;
++						SoundHasWave = 1;
++					}
++				}
++			}
++			else if( Cur == BLK_Cue )
++			{
++				if( Key == TEXT("Name") )
++					CurCueName = Val;
++			}
++			else if( Cur == BLK_CueSoundRef )
++			{
++				if( !CueHasSoundRef && Key == TEXT("Sound") )
++				{
++					CurCueFirstSoundRef = Val;
++					CueHasSoundRef = 1;
++				}
++			}
++			continue;
++		}
++
++		// Otherwise: this is a block header line. Map its text to a type.
++		PendingHeader = Line;
++		if(      Line == TEXT("Wave Bank") )         PendingType = BLK_WaveBank;
++		else if( Line == TEXT("Sound Bank") )        PendingType = BLK_SoundBank;
++		else if( Line == TEXT("Entry") )             PendingType = (Stack(Stack.Num()-1).Type == BLK_WaveBank) ? BLK_WaveEntry : BLK_Other;
++		else if( Line == TEXT("Sound") )             PendingType = (Stack(Stack.Num()-1).Type == BLK_SoundBank) ? BLK_Sound :
++		                                                              (Stack(Stack.Num()-1).Type == BLK_Cue)       ? BLK_CueSoundRef : BLK_Other;
++		else if( Line == TEXT("Cue") )               PendingType = (Stack(Stack.Num()-1).Type == BLK_SoundBank) ? BLK_Cue : BLK_Other;
++		else if( Line == TEXT("Track") )             PendingType = BLK_Track;
++		else if( Line == TEXT("Registered Wave") )   PendingType = BLK_RegisteredWave;
++		else if( Line == TEXT("Pitch and Filter EG") )  PendingType = BLK_PitchFilterEG;
++		else                                         PendingType = BLK_Play; // any other intermediate container
++	}
++
++	// Resolve cues.
++	INT Resolved = 0;
++	for( TMap<FString,FString>::TIterator It(Cues); It; ++It )
++	{
++		const FString& CueName = It.Key();
++		const FString& SoundRef = It.Value();
++		FSoundDef* Sound = Sounds.Find( *SoundRef );
++		if( !Sound || !Sound->HasWave )
++			continue;
++		FString WaveKey = Sound->FirstWave.WaveBank + TEXT("|") + Sound->FirstWave.WaveEntry;
++		FWaveEntry* Entry = WaveEntries.Find( *WaveKey );
++		if( !Entry || Entry->File.Len() == 0 )
++			continue;
++
++		FCueDef Def;
++		Def.WavPath        = Entry->File;
++		Def.Category       = Sound->Category;
++		Def.VolumeMillibel = Sound->VolumeMillibel;
++		Def.Priority       = Sound->Priority;
++		Def.bHasPitchEG    = Sound->HasPitchEG;
++		Def.EG_Delay       = Sound->EG_Delay;
++		Def.EG_Attack      = Sound->EG_Attack;
++		Def.EG_Hold        = Sound->EG_Hold;
++		Def.EG_Decay       = Sound->EG_Decay;
++		Def.EG_Sustain     = Sound->EG_Sustain;
++		Def.EG_Release     = Sound->EG_Release;
++		Def.PitchScaleCents = Sound->PitchScaleCents;
++		// .xap stores cue names with backslash separators (Bank\Sound).
++		// UnrealScript gameplay code references the same cues with dot
++		// separators (e.g. SoundCue=A_TauntBrock.NC_Brock_LostIsYourSoul
++		// in UCVoicePack_Brock.uc). Normalize to dots and uppercase so
++		// PlaySoundCue's string-form lookup matches regardless of the
++		// FName index drift we saw in this build.
++		FString DotName = CueName;
++		DotName = DotName.Replace( TEXT("\\"), TEXT(".") );
++		outCues.Set( *UpperCopy(DotName), Def );
++		Resolved++;
++	}
++
++	debugf( NAME_Init, TEXT("ALCueTable: parsed %s -- %d wave entries, %d sounds, %d cues, %d resolved into table"),
++		AbsXapPath, WaveEntries.Num(), Sounds.Num(), Cues.Num(), Resolved );
++
++	// Probe: check whether specific cues we know gameplay requests are present.
++	const TCHAR* Probes[] = {
++		TEXT("A_Weapon.ST_FireLoop"),
++		TEXT("A_Weapon.ST_PostFire"),
++		TEXT("A_Character.NK_Sobek_Death"),
++		TEXT("A_Character.NK_Selket_Pain"),
++		TEXT("A_Gameplay.MenuPageOpened"),  // known-working control
++	};
++	return Resolved;
++	unguard;
++}

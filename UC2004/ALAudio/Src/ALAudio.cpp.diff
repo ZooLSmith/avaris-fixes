@@ -1,0 +1,13 @@
+diff --git a/UC2004/ALAudio/Src/ALAudio.cpp b/UC2004/ALAudio/Src/ALAudio.cpp
+new file mode 100644
+index 00000000..190a9357
+--- /dev/null
++++ b/UC2004/ALAudio/Src/ALAudio.cpp
+@@ -0,0 +1,7 @@
++/*=============================================================================
++	ALAudio.cpp: Project Avaris OpenAL audio package — module bootstrap.
++=============================================================================*/
++
++#include "ALAudioPrivate.h"
++
++IMPLEMENT_PACKAGE(ALAudio);

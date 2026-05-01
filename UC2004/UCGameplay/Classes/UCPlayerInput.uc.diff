@@ -1,0 +1,30 @@
+diff --git a/UC2004/UCGameplay/Classes/UCPlayerInput.uc b/UC2004/UCGameplay/Classes/UCPlayerInput.uc
+index e689675d..edb23c1b 100644
+--- a/UC2004/UCGameplay/Classes/UCPlayerInput.uc
++++ b/UC2004/UCGameplay/Classes/UCPlayerInput.uc
+@@ -335,7 +335,14 @@ event PlayerInput( float DeltaTime )
+ 	MouseScale_Y	= MouseSensitivity_Y * FOVScale;
+ 
+ 	// Look left/right
+-	aMouseX  = FClamp( aMouseX, -aMouseX_Limit, aMouseX_Limit );
++	// PC port: skip the FClamp -- it caps aMouseX at aMouseX_Limit (default 100,
++	// tuned for an Xbox stick where SpeedBase=100 normalizes stick to that range).
++	// On a mouse with `Speed=6.0` in DefUser.ini, ~17 px/tick already saturates
++	// and aTurn plateaus at aTurn_Limit, producing the "fast mouse hits a wall"
++	// feel. UnrealWarfare's PlayerInput.uc:79 just does `aTurn += aMouseX` --
++	// linear, no clamp. Stick input is unaffected because SpeedBase=100 keeps
++	// stick deltas <= 100 anyway, so the clamp was a no-op for stick and a hard
++	// saturation only for mouse.
+ 	aMouseX *= GetTurnFriction();
+ 	AccelX   = AccelMouse( aMouseX, DeltaTime, aMouseX_AccelLimit, aMouseX_AccelMaxTime, aMouseX_AccelRange, aMouseX_AccelTime );
+ 	if( bNonlinearAccel )	FallOff = aTurn_FallOff;
+@@ -347,8 +354,7 @@ event PlayerInput( float DeltaTime )
+ 	else
+ 		aTurn	= 0;
+ 
+-	// Look up/down.
+-	aMouseY  = FClamp( aMouseY, -aMouseY_Limit, aMouseY_Limit );
++	// Look up/down. Mirror the X-axis change above: no FClamp on PC mouse.
+ 	aMouseY *= GetLookUpFriction();
+ 	AccelY   = AccelMouse( aMouseY, DeltaTime, aMouseY_AccelLimit, aMouseY_AccelMaxTime, aMouseY_AccelRange, aMouseY_AccelTime );
+ 	if( bNonlinearAccel )	FallOff = aLookUp_FallOff;

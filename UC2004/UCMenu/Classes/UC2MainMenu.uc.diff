@@ -1,0 +1,60 @@
+diff --git a/UC2004/UCMenu/Classes/UC2MainMenu.uc b/UC2004/UCMenu/Classes/UC2MainMenu.uc
+index c75a4bcd..4ff2319d 100644
+--- a/UC2004/UCMenu/Classes/UC2MainMenu.uc
++++ b/UC2004/UCMenu/Classes/UC2MainMenu.uc
+@@ -3,13 +3,13 @@
+   Main menu for UC2004
+ 
+   Author: Ron Prestenback
+-  © 2004, Epic Games, Inc. All Rights Reserved
++  ï¿½ 2004, Epic Games, Inc. All Rights Reserved
+ ==============================================================================*/
+ 
+ class UC2MainMenu extends UC2OptionPage;
+ `include(GUI.huc)
+ 
+-var() GUILabelButton btn_Story, btn_Combat, btn_Network, btn_Profiles, btn_Settings;
++var() GUILabelButton btn_Story, btn_Combat, btn_Network, btn_Profiles, btn_Settings, btn_Quit;
+ 
+ var bool bFromStartMenu;
+ 
+@@ -162,6 +162,7 @@ function InitOptions()
+ 	pnl_Options.AddItem( btn_Network );
+ 	pnl_Options.AddItem( btn_Profiles );
+ 	pnl_Options.AddItem( btn_Settings );
++	pnl_Options.AddItem( btn_Quit );
+ 
+ 	FriendNode = btn_Network;
+ 
+@@ -232,6 +233,10 @@ function CloseComplete( GUIComponent Sender, EAnimationType Type )
+ 	case btn_Settings:
+ 		OpenMenu("UCMenu.UC2Settings_Main",,,true);
+ 		break;
++
++	case btn_Quit:
++		PlayerOwner().ConsoleCommand("Exit");
++		break;
+ 	}
+ }
+ 
+@@ -325,4 +330,20 @@ DefaultProperties
+ 		OnClick=ButtonClick
+ 	end object
+ 	btn_Settings=OptionsButton
++
++	begin object class=GUILabelButton name=QuitButton
++		WinWidth=0.429688
++		WinHeight=0.034375
++		WinLeft=0.076563
++		WinTop=0.683333
++		Caption		= "QUIT"
++		StyleName	= "Sui24pt_C8C8C8FF"
++		RenderWeight	= 1.0 // render to the front
++		Hint		= "EXIT TO DESKTOP"
++		ExtendedHint= "QUIT - Exit Unreal Championship 2 and return to the desktop."
++		AutoHorzRange=(Max=275)
++		TabOrder=5
++		OnClick=ButtonClick
++	end object
++	btn_Quit=QuitButton
+ }

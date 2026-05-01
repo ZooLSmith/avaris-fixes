@@ -1,0 +1,14 @@
+diff --git a/UC2004/D3DDrv/Src/D3DDrv.vcproj b/UC2004/D3DDrv/Src/D3DDrv.vcproj
+index ec006dd0..05c513d2 100644
+--- a/UC2004/D3DDrv/Src/D3DDrv.vcproj
++++ b/UC2004/D3DDrv/Src/D3DDrv.vcproj
+@@ -233,6 +233,9 @@
+ 		<File
+ 			RelativePath=".\D3DResourceCleanup.cpp">
+ 		</File>
++		<File
++			RelativePath=".\D3DMoviePlayback.cpp">
++		</File>
+ 		<File
+ 			RelativePath=".\D3DShaderConstants.h">
+ 		</File>

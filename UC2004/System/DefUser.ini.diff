@@ -1,0 +1,30 @@
+diff --git a/UC2004/System/DefUser.ini b/UC2004/System/DefUser.ini
+index cfd60b26..1629b441 100644
+--- a/UC2004/System/DefUser.ini
++++ b/UC2004/System/DefUser.ini
+@@ -275,13 +275,20 @@ bShadowFromLights=false
+ MouseSensitivity_X=1.0
+ MouseSensitivity_Y=0.9
+ 
+-bNonlinearAccel=true
++; PC port: aTurn_Limit/aMouseX_Limit ratio is a hard-coded amplifier in
++; UCPlayerInput.uc:344 (aTurn = (aMouseX/aMouseX_Limit) * aTurn_Limit *
++; ...). Stock 1024/100 = 10.24x is correct for an Xbox stick (full push
++; produces aMouseX=100 and a max turn rate of aTurn_Limit). For a mouse
++; with Speed=6.0 in the bind, that 10.24x sits above MouseSensitivity --
++; cranking the slider down doesn't reach a usable feel. Setting the
++; ratio to 1.0 mirrors UnrealWarfare's `aTurn += aMouseX` pipeline.
++bNonlinearAccel=false
+ aMouseX_Limit=100
+-aTurn_Limit=1024
+-aTurn_FallOff=2.0
++aTurn_Limit=100
++aTurn_FallOff=1.0
+ aMouseY_Limit=100
+-aLookUp_Limit=1024
+-aLookUp_FallOff=2.0
++aLookUp_Limit=100
++aLookUp_FallOff=1.0
+ 
+ bAccelMultipliers=true
+ aMouseX_AccelLimit=95.0

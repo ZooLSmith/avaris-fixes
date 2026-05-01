@@ -1,0 +1,37 @@
+diff --git a/UC2004/Avaris.sln b/UC2004/Avaris.sln
+index 038f0ead..9a699c9d 100644
+--- a/UC2004/Avaris.sln
++++ b/UC2004/Avaris.sln
+@@ -4,6 +4,12 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "!BuildAll", "!BuildAll\!Bui
+ 		{B0870A3E-51E2-4694-B3CB-83C64D05C473} = {B0870A3E-51E2-4694-B3CB-83C64D05C473}
+ 	EndProjectSection
+ EndProject
++Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ALAudio", "ALAudio\Src\ALAudio.vcproj", "{A11A4D10-0001-4A11-A11A-A11A4D101001}"
++	ProjectSection(ProjectDependencies) = postProject
++		{67673385-AC13-4431-9461-E4040A9B5A1A} = {67673385-AC13-4431-9461-E4040A9B5A1A}
++		{04B6E3A6-05D5-4A97-BB87-B90885C79A52} = {04B6E3A6-05D5-4A97-BB87-B90885C79A52}
++	EndProjectSection
++EndProject
+ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Core", "Core\Src\Core.vcproj", "{67673385-AC13-4431-9461-E4040A9B5A1A}"
+ 	ProjectSection(ProjectDependencies) = postProject
+ 		{C29B9BDF-1017-4973-A266-2F866A051387} = {C29B9BDF-1017-4973-A266-2F866A051387}
+@@ -875,6 +881,19 @@ Global
+ 		{C29B9BDF-1017-4973-A266-2F866A051387}.Xbox Release LL Final.ActiveCfg = Unicode Debug|Win32
+ 		{C29B9BDF-1017-4973-A266-2F866A051387}.Xbox Release LS.ActiveCfg = Unicode Debug|Win32
+ 		{C29B9BDF-1017-4973-A266-2F866A051387}.XBox Release Profile.ActiveCfg = Unicode Debug|Win32
++		{A11A4D10-0001-4A11-A11A-A11A4D101001}.Debug.ActiveCfg = Release|Win32
++		{A11A4D10-0001-4A11-A11A-A11A4D101001}.Release.ActiveCfg = Release|Win32
++		{A11A4D10-0001-4A11-A11A-A11A4D101001}.Release.Build.0 = Release|Win32
++		{A11A4D10-0001-4A11-A11A-A11A4D101001}.Unicode Debug.ActiveCfg = Release|Win32
++		{A11A4D10-0001-4A11-A11A-A11A4D101001}.XBox Debug.ActiveCfg = Release|Win32
++		{A11A4D10-0001-4A11-A11A-A11A4D101001}.Xbox Debug LL.ActiveCfg = Release|Win32
++		{A11A4D10-0001-4A11-A11A-A11A4D101001}.Xbox Debug LS.ActiveCfg = Release|Win32
++		{A11A4D10-0001-4A11-A11A-A11A4D101001}.XBox Release.ActiveCfg = Release|Win32
++		{A11A4D10-0001-4A11-A11A-A11A4D101001}.Xbox Release Final.ActiveCfg = Release|Win32
++		{A11A4D10-0001-4A11-A11A-A11A4D101001}.Xbox Release LL.ActiveCfg = Release|Win32
++		{A11A4D10-0001-4A11-A11A-A11A4D101001}.Xbox Release LL Final.ActiveCfg = Release|Win32
++		{A11A4D10-0001-4A11-A11A-A11A4D101001}.Xbox Release LS.ActiveCfg = Release|Win32
++		{A11A4D10-0001-4A11-A11A-A11A4D101001}.XBox Release Profile.ActiveCfg = Release|Win32
+ 	EndGlobalSection
+ 	GlobalSection(ExtensibilityGlobals) = postSolution
+ 	EndGlobalSection

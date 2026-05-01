@@ -1,0 +1,37 @@
+diff --git a/UC2004/System/avaris.ini b/UC2004/System/avaris.ini
+index 19319820..d7446560 100644
+--- a/UC2004/System/avaris.ini
++++ b/UC2004/System/avaris.ini
+@@ -19,7 +19,7 @@ FirstRun=2226
+ RenderDevice=D3DDrv.D3DRenderDevice
+ ;RenderDevice=Engine.NullRenderDevice
+ ;RenderDevice=OpenGLDrv.OpenGLRenderDevice
+-AudioDevice=Engine.NullAudioDevice
++AudioDevice=ALAudio.ALAudioSubsystem
+ NetworkDevice=IpDrv.TcpNetDriver
+ DemoRecordingDevice=Engine.DemoRecDriver
+ Console=Engine.Console
+@@ -100,18 +100,18 @@ UseStaticMeshBatching=False
+ bServerRefChecking=False
+ 
+ [WinDrv.WindowsClient]
+-WindowedViewportX=640
+-WindowedViewportY=480
++WindowedViewportX=1280
++WindowedViewportY=720
+ FullscreenViewportX=1920
+ FullscreenViewportY=1080
+-MenuViewportX=640
+-MenuViewportY=480
++MenuViewportX=1280
++MenuViewportY=720
+ Brightness=0.850000
+ Contrast=0.700000
+ Gamma=1.100000
+ UseJoystick=False
+ CaptureMouse=True
+-StartupFullscreen=True
++StartupFullscreen=False
+ ScreenFlashes=True
+ NoLighting=False
+ MinDesiredFrameRate=35.000000

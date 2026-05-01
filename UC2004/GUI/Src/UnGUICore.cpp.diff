@@ -1,0 +1,103 @@
+diff --git a/UC2004/GUI/Src/UnGUICore.cpp b/UC2004/GUI/Src/UnGUICore.cpp
+index 4c066b79..e8c32068 100644
+--- a/UC2004/GUI/Src/UnGUICore.cpp
++++ b/UC2004/GUI/Src/UnGUICore.cpp
+@@ -212,7 +212,7 @@ void UGUIController::RenderDesignMode( UCanvas* Canvas )
+ 
+ 				for ( i = Lines.Num() - 1; i > 0; i-- )
+ 				{
+-					Canvas->DrawTextJustified(0, 0, Y, Canvas->SizeX, Y + YL, 1.f, 1.f, TEXT("»» %s"), *Lines(i));
++					Canvas->DrawTextJustified(0, 0, Y, Canvas->SizeX, Y + YL, 1.f, 1.f, TEXT("ï¿½ï¿½ %s"), *Lines(i));
+ 
+ 					Y -= YL;
+ 					Canvas->DrawTile(DefaultPens[0], 0,Y,Canvas->SizeX, YL,0,0,32,32, 0.0f, Black);
+@@ -235,7 +235,7 @@ void UGUIController::RenderDesignMode( UCanvas* Canvas )
+ 
+ 				for ( i = Lines.Num() - 1; i > 0; i-- )
+ 				{
+-					Canvas->DrawTextJustified(0, 0, Y, Canvas->SizeX, Y + YL, 1.f, 1.f, TEXT("»» %s"), *Lines(i));
++					Canvas->DrawTextJustified(0, 0, Y, Canvas->SizeX, Y + YL, 1.f, 1.f, TEXT("ï¿½ï¿½ %s"), *Lines(i));
+ 					Y -= YL;
+ 					Canvas->DrawTile(DefaultPens[0], 0,Y,Canvas->SizeX, YL,0,0,32,32, 0.0f, Black);
+ 				}
+@@ -262,7 +262,7 @@ void UGUIController::RenderDesignMode( UCanvas* Canvas )
+ 				Canvas->WrapStringToArray( MenuPath, &Lines, ResX );
+ 				for ( i = Lines.Num() - 1; i > 0; i-- )
+ 				{
+-					Canvas->DrawTextJustified(2, 0, Y, Canvas->SizeX, Y + YL, 1.f, 1.f, TEXT("%s ««"), *Lines(i));
++					Canvas->DrawTextJustified(2, 0, Y, Canvas->SizeX, Y + YL, 1.f, 1.f, TEXT("%s ï¿½ï¿½"), *Lines(i));
+ 					Y -= YL;
+ 					Canvas->DrawTile(DefaultPens[0], 0,Y,Canvas->SizeX, YL,0,0,32,32, 0.0f, Black);
+ 				}
+@@ -690,15 +690,27 @@ void UGUIController::GetCursorPos( INT& ptX, INT& ptY )
+ 	UViewport* Viewport = Cast<UViewport>(ViewportOwner);
+ 	if ( Viewport )
+ 	{
++		FLOAT vx, vy;
+ 		if ( Viewport->IsFullscreen() )
+ 		{
+-			ptX = MouseX, ptY = MouseY;
+-			return;
++			vx = (FLOAT)MouseX;
++			vy = (FLOAT)MouseY;
+ 		}
+-
+-		Viewport->UpdateMousePosition();
+-		ptX = (INT) Viewport->WindowsMouseX;
+-		ptY = (INT) Viewport->WindowsMouseY;
++		else
++		{
++			Viewport->UpdateMousePosition();
++			vx = Viewport->WindowsMouseX;
++			vy = Viewport->WindowsMouseY;
++		}
++		// PC port: translate viewport-pixel mouse coords to the 640x480
++		// design space the rest of the GUI uses (ResX/ResY are locked to
++		// design dims for the pillarbox path). Pillarbox region is
++		// centred at PbX..PbX+PbW horizontally; full height vertically.
++		const FLOAT PbScale = (FLOAT)Viewport->SizeY / 480.f;
++		const FLOAT PbW = 640.f * PbScale;
++		const FLOAT PbX = ((FLOAT)Viewport->SizeX - PbW) * 0.5f;
++		ptX = (INT)( PbW > 0.f ? ((vx - PbX) * 640.f / PbW) : vx );
++		ptY = (INT)( PbScale > 0.f ? (vy / PbScale) : vy );
+ 	}
+ 	unguard;
+ }
+@@ -1386,8 +1398,15 @@ void  UGUIController::NativePreRender(UCanvas* Canvas)
+ 		return;
+ 
+ 	UViewport* Viewport = CastChecked<UViewport>(ViewportOwner);
+-	ResX = Viewport->SizeX;
+-	ResY = Viewport->SizeY;
++	// PC port: GUI is rendered into a centred 640x480 pillarbox region.
++	// ResX/ResY drive UGUIComponent::ActualLeft/etc fraction-mode math
++	// AND ValidMousePos/eventMoveFocused bounds checks. Keep them at
++	// design dims always so layout, hover-overlay positioning, and
++	// keyboard navigation all agree on the same coord space.
++	// GetCursorPos translates viewport-pixel mouse coords into the same
++	// 640x480 design space so click hit-testing matches.
++	ResX = 640;
++	ResY = 480;
+ 
+ 	// If we are using the Windows Mouse.. pass it along before any rendering
+ 	Viewport->bShowWindowsMouse = Viewport->bWindowsMouseAvailable;
+@@ -1592,8 +1611,17 @@ void  UGUIController::NativePostRender(UCanvas* Canvas)
+ 	else
+ 	{
+ 		LastMouseX = MouseX;
+-		MouseX = ViewportOwner->WindowsMouseX;
+-		MouseY = ViewportOwner->WindowsMouseY;
++		// PC port: WindowsMouseX/Y are raw viewport-pixel coords. The
++		// rest of the GUI (WithinBounds, ActualLeft, hover overlays)
++		// operates in 640x480 design space because of the pillarbox
++		// path -- translate so MouseX/MouseY stay consistent with
++		// control bounds. Same mapping as GetCursorPos.
++		UViewport* MV = Cast<UViewport>(ViewportOwner);
++		const FLOAT MPbScale = (FLOAT)MV->SizeY / 480.f;
++		const FLOAT MPbW = 640.f * MPbScale;
++		const FLOAT MPbX = ((FLOAT)MV->SizeX - MPbW) * 0.5f;
++		MouseX = ( MPbW > 0.f ) ? ( (MV->WindowsMouseX - MPbX) * 640.f / MPbW ) : MV->WindowsMouseX;
++		MouseY = ( MPbScale > 0.f ) ? ( MV->WindowsMouseY / MPbScale ) : MV->WindowsMouseY;
+ 
+ 		if ( ActiveControl )
+ 			ViewportOwner->SelectedCursor = ActiveControl->MouseCursorIndex;

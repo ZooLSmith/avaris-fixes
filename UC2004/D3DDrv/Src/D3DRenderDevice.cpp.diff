@@ -1,0 +1,132 @@
+diff --git a/UC2004/D3DDrv/Src/D3DRenderDevice.cpp b/UC2004/D3DDrv/Src/D3DRenderDevice.cpp
+index ae3ca94e..aaff8a2b 100644
+--- a/UC2004/D3DDrv/Src/D3DRenderDevice.cpp
++++ b/UC2004/D3DDrv/Src/D3DRenderDevice.cpp
+@@ -1518,12 +1518,37 @@ void UD3DRenderDevice::Flush(UViewport* Viewport)
+ 	// scion sz
+ 	// no need to clear out combined vertex shader microcodes
+ 	// they should persist.  They get cleaned up in UD3DRenderDevice::Destroy
+-	// 
++	//
++
++	// vs2003-port fix: Xbox keeps VS/PS objects across Flush because the
++	// console has no device-lost path -- handles stay valid. On PC every
++	// SetRes does Release+CreateDevice, so cached FVertexShader/FPixelShader
++	// handles point at a dead device after alt-tab. The next Commit reads
++	// WantedState.VertexShader->Handle into SetVertexShader() and GPFs
++	// down in FD3DInternalState::Commit during the first BSP draw of the
++	// new frame. UnrealWarfare's reference PC Flush deletes both lists
++	// unconditionally; mirror that on PC, keep the persistence on Xbox.
++#ifndef _XBOX
++	guard(VertexShadersPC);
++	while(VertexShaders)
++		delete VertexShaders;
++	unguard;
+ 
++	guard(PixelShadersPC);
++	for( INT i=0; i<PixelShaders.Num(); i++ )
++	{
++		if( PixelShaders(i) )
++		{
++			delete PixelShaders(i);
++			PixelShaders(i)=NULL;
++		}
++	}
++	unguard;
++#else
+ 	if( !Viewport ||
+ 		Viewport->GetOuterUClient()->Viewports.Num() == 0 )
+ 	{
+-		// scion sz 
++		// scion sz
+ 		guard(VertexShaders);
+ 		while(VertexShaders)
+ 			delete VertexShaders;
+@@ -1542,8 +1567,20 @@ void UD3DRenderDevice::Flush(UViewport* Viewport)
+ 		}
+ 		unguard;
+ 	}
++#endif
+ 
+-	if( Viewport && 
++#ifdef _XBOX
++	// PC port: the FOcclusionQueryManager is a UC2/Xbox NV2A bounding-box
++	// hardware occlusion subsystem; the sibling UE2 trees (UnrealWarfare,
++	// UT2003, UT2004) don't have it at all, and on PC FD3DRenderInterface::
++	// GetOcclusionQueryResults is a `return 1` stub. The Flush path on PC
++	// alt-tab (D3DERR_DEVICENOTRESET -> SetRes -> Flush) walks WaitingList
++	// nodes that the per-frame SubmitQueries drain pattern leaves in an
++	// inconsistent state mid-frame, GPF'ing in ClearWaitingQueries. Skip
++	// the cleanup on PC to match reference behavior -- the pool grows
++	// monotonically across level changes but bounded by the per-frame
++	// drain through SubmitQueries->ClearWaitingQueries.
++	if( Viewport &&
+ 		Viewport->GetViewportIndex()==0 )
+ 	{
+ 		// clear pending occlusion queries
+@@ -1555,6 +1592,7 @@ void UD3DRenderDevice::Flush(UViewport* Viewport)
+ 		// free the global hw occlusion pool items
+ 		FlushHWOcclusionQueryPool();
+ 	}
++#endif
+ 
+ 	PrecacheOnFlip = UsePrecaching;
+ 
+@@ -1630,7 +1668,18 @@ UBOOL UD3DRenderDevice::Exec(const TCHAR* Cmd,FOutputDevice& Ar)
+ {
+ 	guard(UD3DRenderDevice::Exec);
+ 
+-	if(ParseCommand(&Cmd,TEXT("DUMPRESOURCEHASH")))
++	// PC port: console-trigger XMV cutscene playback for testing the
++	// D3DMoviePlayback path without going through the engine's #ifdef _XBOX
++	// LoadMap hooks. Usage from in-game console: PLAYMOVIE UC2_Logos
++	if(ParseCommand(&Cmd,TEXT("PLAYMOVIE")))
++	{
++		extern void DecodeMovieFile( const TCHAR* MoviePath );
++		FString Path = FString::Printf( TEXT("..\\Movies\\%s.xmv"), Cmd );
++		Ar.Logf( TEXT("PLAYMOVIE %s"), *Path );
++		DecodeMovieFile( *Path );
++		return 1;
++	}
++	else if(ParseCommand(&Cmd,TEXT("DUMPRESOURCEHASH")))
+ 	{
+ 		//scion jg -- Changed for the new hashing scheme
+ 		Ar.Log(TEXT("Texture Cache:"));
+@@ -1774,6 +1823,37 @@ UBOOL UD3DRenderDevice::Exec(const TCHAR* Cmd,FOutputDevice& Ar)
+ 
+ 		return 1;
+ 	}
++	else if( ParseCommand(&Cmd,TEXT("LISTRESOLUTIONS")) )
++	{
++		// Emit "WxH|WxH|WxH|" -- pipe-delimited because
++		// FStringOutputDevice::Serialize (which captures the output of
++		// PlayerController::ConsoleCommand) appends without any line
++		// terminator, so multiple Ar.Logf calls would concatenate into
++		// one string with no usable boundary. Trailing '|' makes
++		// script-side Split skip the empty tail naturally.
++		// EnumAdapterModes returns each WxH multiple times (one per
++		// bit-depth / refresh rate); de-dup by tracking seen pairs.
++		// >= 640x480 filter drops legacy modes that would render the
++		// menus unusable.
++		TArray<DWORD> Seen;
++		FString Out;
++		for( INT i = 0; i < DisplayModes.Num(); i++ )
++		{
++			D3DDISPLAYMODE& M = DisplayModes(i);
++			if( M.Width < 640 || M.Height < 480 )
++				continue;
++			DWORD Key = (DWORD(M.Width) << 16) | DWORD(M.Height);
++			UBOOL Dup = 0;
++			for( INT j = 0; j < Seen.Num(); j++ )
++				if( Seen(j) == Key ) { Dup = 1; break; }
++			if( Dup )
++				continue;
++			Seen.AddItem(Key);
++			Out += FString::Printf( TEXT("%ux%u|"), M.Width, M.Height );
++		}
++		Ar.Log( *Out );
++		return 1;
++	}
+ #ifdef _XBOX
+ #ifndef FINAL_RELEASE
+ 	//scion jg -- This command enables the single step pusher, which causes

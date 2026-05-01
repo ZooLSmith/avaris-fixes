@@ -1,0 +1,43 @@
+diff --git a/UC2004/Engine/Src/UnScriptPatcher.cpp b/UC2004/Engine/Src/UnScriptPatcher.cpp
+index 7c5ea1b1..06e4f5a9 100644
+--- a/UC2004/Engine/Src/UnScriptPatcher.cpp
++++ b/UC2004/Engine/Src/UnScriptPatcher.cpp
+@@ -132,6 +132,38 @@ UBOOL FLinkerPatchData::Apply( ULinkerLoad* Loader, FPatchReader& Ar, UBOOL bCre
+ {
+ 	guard(FLinkerPatchData::Apply);
+ 
++	// PC port: patches were baked against the Xbox-shipped .u layouts
++	// (each FLinkerPatchData hardcodes the package's original NameCount /
++	// ExportCount). When we rebuild a script package from source via
++	// UCC make, those counts shift and the relative export indices in
++	// BuildExport(...) point at wrong slots, causing CreateExport to
++	// return NULL and the assertion at UnLinker.cpp:965 to fire.
++	//
++	// Skip the patch (with a warning) if the loaded package no longer
++	// matches the patch's baseline. The .uc source already contains the
++	// fixed-up code that the binary patch was applying, so for rebuilt
++	// packages the patch is redundant anyway.
++	if ( Loader->NameMap.Num() != NameCount
++		|| Loader->ExportMap.Num() != ExportCount )
++	{
++		debugf( NAME_DevLoad,
++			TEXT("ScriptPatcher: skipping stale patch for %s (loaded names=%d/exports=%d, patch baseline names=%d/exports=%d -- package was rebuilt)"),
++			*PackageName,
++			Loader->NameMap.Num(), Loader->ExportMap.Num(),
++			NameCount, ExportCount );
++		// Drop the queued additions so the caller doesn't retry.
++		Names.Empty();
++		Imports.Empty();
++		Exports.Empty();
++		for ( INT i = 0; i < Objects.Num(); i++ )
++			delete Objects(i);
++		Objects.Empty();
++		for ( INT i = 0; i < ScriptPatches.Num(); i++ )
++			delete ScriptPatches(i);
++		ScriptPatches.Empty();
++		return TRUE;
++	}
++
+ 	// add any new names to the linker's name table
+ 	for ( INT i = 0; i < Names.Num(); i++ )
+ 	{

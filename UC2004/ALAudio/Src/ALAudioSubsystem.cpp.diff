@@ -1,0 +1,1030 @@
+diff --git a/UC2004/ALAudio/Src/ALAudioSubsystem.cpp b/UC2004/ALAudio/Src/ALAudioSubsystem.cpp
+new file mode 100644
+index 00000000..f753a49e
+--- /dev/null
++++ b/UC2004/ALAudio/Src/ALAudioSubsystem.cpp
+@@ -0,0 +1,1024 @@
++/*=============================================================================
++	ALAudioSubsystem.cpp: UAudioSubsystem implementation backed by OpenAL.
++
++	v0 SCAFFOLD: every entry point logs and stubs out to a safe value.
++	Init() returns 1 so the engine treats us as a working subsystem and
++	doesn't fall back to NullAudioDevice; gameplay code that calls into
++	PlaySoundCue / GetCategoryVolume / NotifyLevelChange therefore exercises
++	the real binding -- silence is expected, but the wiring is verifiable.
++=============================================================================*/
++
++#include "ALAudioPrivate.h"
++
++IMPLEMENT_CLASS(UALAudioSubsystem);
++
++// Dynamically resolved OpenAL entry points. We ship only the SDK headers
++// (UC2004/OpenAL/Inc/), no .lib import library, so every function is
++// LoadLibrary + GetProcAddress'd at Init() time. v0 binds only the device
++// + context primitives needed to verify the runtime is reachable; the
++// source/buffer/3D entry points come in with PlaySoundCue.
++typedef ALCdevice*  (__cdecl *Pfn_alcOpenDevice)(ALCubyte*);
++typedef ALCvoid     (__cdecl *Pfn_alcCloseDevice)(ALCdevice*);
++typedef ALCcontext* (__cdecl *Pfn_alcCreateContext)(ALCdevice*, ALCint*);
++typedef ALCboolean  (__cdecl *Pfn_alcMakeContextCurrent)(ALCcontext*);
++typedef ALCvoid     (__cdecl *Pfn_alcDestroyContext)(ALCcontext*);
++typedef ALCenum     (__cdecl *Pfn_alcGetError)(ALCdevice*);
++typedef ALCubyte*   (__cdecl *Pfn_alcGetString)(ALCdevice*, ALCenum);
++
++typedef ALvoid  (__cdecl *Pfn_alGenBuffers)(ALsizei, ALuint*);
++typedef ALvoid  (__cdecl *Pfn_alDeleteBuffers)(ALsizei, ALuint*);
++typedef ALvoid  (__cdecl *Pfn_alBufferData)(ALuint, ALenum, ALvoid*, ALsizei, ALsizei);
++typedef ALvoid  (__cdecl *Pfn_alGenSources)(ALsizei, ALuint*);
++typedef ALvoid  (__cdecl *Pfn_alDeleteSources)(ALsizei, ALuint*);
++typedef ALvoid  (__cdecl *Pfn_alSourcei)(ALuint, ALenum, ALint);
++typedef ALvoid  (__cdecl *Pfn_alSourcef)(ALuint, ALenum, ALfloat);
++typedef ALvoid  (__cdecl *Pfn_alSource3f)(ALuint, ALenum, ALfloat, ALfloat, ALfloat);
++typedef ALvoid  (__cdecl *Pfn_alSourcePlay)(ALuint);
++typedef ALvoid  (__cdecl *Pfn_alSourceStop)(ALuint);
++typedef ALvoid  (__cdecl *Pfn_alSourcePause)(ALuint);
++typedef ALvoid  (__cdecl *Pfn_alGetSourcei)(ALuint, ALenum, ALint*);
++typedef ALvoid  (__cdecl *Pfn_alListener3f)(ALenum, ALfloat, ALfloat, ALfloat);
++typedef ALvoid  (__cdecl *Pfn_alListenerfv)(ALenum, ALfloat*);
++typedef ALenum  (__cdecl *Pfn_alGetError)(ALvoid);
++
++static Pfn_alcOpenDevice          p_alcOpenDevice;
++static Pfn_alcCloseDevice         p_alcCloseDevice;
++static Pfn_alcCreateContext       p_alcCreateContext;
++static Pfn_alcMakeContextCurrent  p_alcMakeContextCurrent;
++static Pfn_alcDestroyContext      p_alcDestroyContext;
++static Pfn_alcGetError            p_alcGetError;
++static Pfn_alcGetString           p_alcGetString;
++
++static Pfn_alGenBuffers           p_alGenBuffers;
++static Pfn_alDeleteBuffers        p_alDeleteBuffers;
++static Pfn_alBufferData           p_alBufferData;
++static Pfn_alGenSources           p_alGenSources;
++static Pfn_alDeleteSources        p_alDeleteSources;
++static Pfn_alSourcei              p_alSourcei;
++static Pfn_alSourcef              p_alSourcef;
++static Pfn_alSource3f             p_alSource3f;
++static Pfn_alSourcePlay           p_alSourcePlay;
++static Pfn_alSourceStop           p_alSourceStop;
++static Pfn_alSourcePause          p_alSourcePause;
++
++// PC port: published instance pointer for the cutscene playback hooks
++// (UCMovieAudioDuck / UCMovieGetCategoryVolume) to find the live audio
++// subsystem. Set in Init(), cleared in Destroy().
++static UALAudioSubsystem*         GALAudio = NULL;
++static Pfn_alGetSourcei           p_alGetSourcei;
++static Pfn_alListener3f           p_alListener3f;
++static Pfn_alListenerfv           p_alListenerfv;
++static Pfn_alGetError             p_alGetError;
++
++#define AL_RESOLVE(handle, name) \
++	(p_##name = (Pfn_##name)GetProcAddress((HMODULE)(handle), #name))
++
++UBOOL UALAudioSubsystem::BindOpenAL()
++{
++	guard(UALAudioSubsystem::BindOpenAL);
++
++	DLLHandle = (void*)LoadLibraryA("OpenAL32.dll");
++	if( !DLLHandle )
++	{
++		debugf( NAME_Init, TEXT("ALAudio: LoadLibrary(OpenAL32.dll) failed (%u) -- install OpenAL Soft or copy OpenAL32.dll next to Avaris.exe"), GetLastError() );
++		return 0;
++	}
++
++	if( !AL_RESOLVE(DLLHandle, alcOpenDevice)
++	 || !AL_RESOLVE(DLLHandle, alcCloseDevice)
++	 || !AL_RESOLVE(DLLHandle, alcCreateContext)
++	 || !AL_RESOLVE(DLLHandle, alcMakeContextCurrent)
++	 || !AL_RESOLVE(DLLHandle, alcDestroyContext)
++	 || !AL_RESOLVE(DLLHandle, alcGetError)
++	 || !AL_RESOLVE(DLLHandle, alcGetString)
++	 || !AL_RESOLVE(DLLHandle, alGenBuffers)
++	 || !AL_RESOLVE(DLLHandle, alDeleteBuffers)
++	 || !AL_RESOLVE(DLLHandle, alBufferData)
++	 || !AL_RESOLVE(DLLHandle, alGenSources)
++	 || !AL_RESOLVE(DLLHandle, alDeleteSources)
++	 || !AL_RESOLVE(DLLHandle, alSourcei)
++	 || !AL_RESOLVE(DLLHandle, alSourcef)
++	 || !AL_RESOLVE(DLLHandle, alSource3f)
++	 || !AL_RESOLVE(DLLHandle, alSourcePlay)
++	 || !AL_RESOLVE(DLLHandle, alSourceStop)
++	 || !AL_RESOLVE(DLLHandle, alSourcePause)
++	 || !AL_RESOLVE(DLLHandle, alGetSourcei)
++	 || !AL_RESOLVE(DLLHandle, alListener3f)
++	 || !AL_RESOLVE(DLLHandle, alListenerfv)
++	 || !AL_RESOLVE(DLLHandle, alGetError) )
++	{
++		debugf( NAME_Init, TEXT("ALAudio: GetProcAddress failed for one or more ALC entry points -- OpenAL32.dll missing required exports") );
++		FreeLibrary( (HMODULE)DLLHandle );
++		DLLHandle = NULL;
++		return 0;
++	}
++
++	return 1;
++	unguard;
++}
++
++void UALAudioSubsystem::UnbindOpenAL()
++{
++	guard(UALAudioSubsystem::UnbindOpenAL);
++
++	// Tear down music source/buffer first (separate from SFX pool).
++	if( p_alSourceStop && MusicSource )
++		p_alSourceStop( MusicSource );
++	if( p_alDeleteBuffers && MusicBuffer )
++	{
++		p_alDeleteBuffers( 1, &MusicBuffer );
++		MusicBuffer = 0;
++	}
++	if( p_alDeleteSources && MusicSource )
++	{
++		p_alDeleteSources( 1, &MusicSource );
++		MusicSource = 0;
++	}
++	CurrentMusicHandle = 0;
++	CurrentMusicSong = TEXT("");
++
++	// Tear down the source pool and buffer cache while AL is still bound.
++	if( p_alSourceStop && p_alDeleteSources )
++	{
++		for( INT i = 0; i < SourcePool.Num(); i++ )
++		{
++			p_alSourceStop( SourcePool(i).Source );
++			p_alDeleteSources( 1, &SourcePool(i).Source );
++		}
++	}
++	SourcePool.Empty();
++	if( p_alDeleteBuffers )
++	{
++		for( TMap<FString,ALuint>::TIterator It(BufferCache); It; ++It )
++		{
++			ALuint B = It.Value();
++			p_alDeleteBuffers( 1, &B );
++		}
++	}
++	BufferCache.Empty();
++
++	if( SoundContext )
++	{
++		if( p_alcMakeContextCurrent ) p_alcMakeContextCurrent( NULL );
++		if( p_alcDestroyContext ) p_alcDestroyContext( SoundContext );
++		SoundContext = NULL;
++	}
++	if( SoundDevice )
++	{
++		if( p_alcCloseDevice ) p_alcCloseDevice( SoundDevice );
++		SoundDevice = NULL;
++	}
++	if( DLLHandle )
++	{
++		FreeLibrary( (HMODULE)DLLHandle );
++		DLLHandle = NULL;
++	}
++	p_alcOpenDevice = NULL;
++	p_alcCloseDevice = NULL;
++	p_alcCreateContext = NULL;
++	p_alcMakeContextCurrent = NULL;
++	p_alcDestroyContext = NULL;
++	p_alcGetError = NULL;
++	p_alcGetString = NULL;
++	p_alGenBuffers = NULL;
++	p_alDeleteBuffers = NULL;
++	p_alBufferData = NULL;
++	p_alGenSources = NULL;
++	p_alDeleteSources = NULL;
++	p_alSourcei = NULL;
++	p_alSourcef = NULL;
++	p_alSource3f = NULL;
++	p_alSourcePlay = NULL;
++	p_alSourceStop = NULL;
++	p_alSourcePause = NULL;
++	p_alGetSourcei = NULL;
++	p_alListener3f = NULL;
++	p_alListenerfv = NULL;
++	p_alGetError = NULL;
++	unguard;
++}
++
++#define MAX_AL_SOURCES 32
++
++UALAudioSubsystem::UALAudioSubsystem()
++{
++	guard(UALAudioSubsystem::UALAudioSubsystem);
++	Viewport = NULL;
++	DLLHandle = NULL;
++	SoundDevice = NULL;
++	SoundContext = NULL;
++	MusicSource = 0;
++	MusicBuffer = 0;
++	NextMusicHandle = 1;
++	CurrentMusicHandle = 0;
++	for( INT i = 0; i < UAudioSubsystem::VOLUME_Max; i++ )
++		CategoryVolumes[i] = 1.f;
++	unguard;
++}
++
++void UALAudioSubsystem::StaticConstructor()
++{
++	guard(UALAudioSubsystem::StaticConstructor);
++	unguard;
++}
++
++void UALAudioSubsystem::Destroy()
++{
++	guard(UALAudioSubsystem::Destroy);
++	if( GALAudio == this )
++		GALAudio = NULL;
++	UnbindOpenAL();
++	Super::Destroy();
++	unguard;
++}
++
++UBOOL UALAudioSubsystem::Init()
++{
++	guard(UALAudioSubsystem::Init);
++
++	if( !BindOpenAL() )
++	{
++		// Returning 0 makes UEngine::InitAudio fall back to NullAudioDevice;
++		// game continues silent rather than crashing.
++		return 0;
++	}
++
++	// Publish our instance for the cutscene-playback hooks (UCMovieAudioDuck
++	// and UCMovieGetCategoryVolume) to access. They're called via
++	// GetProcAddress from D3DDrv so they can't see this pointer otherwise.
++	GALAudio = this;
++
++	SoundDevice = p_alcOpenDevice( NULL );
++	if( !SoundDevice )
++	{
++		debugf( NAME_Init, TEXT("ALAudio: alcOpenDevice failed -- no default playback device") );
++		UnbindOpenAL();
++		return 0;
++	}
++
++	SoundContext = p_alcCreateContext( SoundDevice, NULL );
++	if( !SoundContext || !p_alcMakeContextCurrent( SoundContext ) )
++	{
++		debugf( NAME_Init, TEXT("ALAudio: alcCreateContext / alcMakeContextCurrent failed (alcGetError=%d)"), p_alcGetError(SoundDevice) );
++		UnbindOpenAL();
++		return 0;
++	}
++
++	const ALCubyte* DeviceName = p_alcGetString( SoundDevice, 0x1005 /*ALC_DEVICE_SPECIFIER*/ );
++	debugf( NAME_Init, TEXT("ALAudio: device opened (%s)"),
++		DeviceName ? appFromAnsi((const ANSICHAR*)DeviceName) : TEXT("default") );
++
++	// Parse Avaris.xap into our FName -> FCueDef table. Path is relative
++	// to the runtime CWD (System/), so the "..\Sounds\Avaris.xap" hop
++	// resolves to UC2004/Sounds/Avaris.xap.
++	ParseAvarisXAP( TEXT("..\\Sounds\\Avaris.xap"), Cues );
++
++	// Seed CategoryVolumes from the user's saved profile so menu music
++	// plays at the saved level from boot, not at full 1.0 until the
++	// menu's first profile-binding step pushes the values via
++	// SetCategoryVolume. Falls back to class defaults if the load/save
++	// manager isn't ready or no profile exists yet.
++	//
++	// Mirrors (and extends) the Xbox init in
++	// XboxAudio/Src/XACTAudioSubsystem.cpp:203, which only reads class
++	// defaults -- the saved-profile load is a PC-port addition because
++	// PC users care more about menu-music level on a desktop.
++	{
++		UPlayerProfile* DefaultProfile = UPlayerProfile::StaticClass()->GetDefaultObject<UPlayerProfile>();
++		FLOAT MusicVol = DefaultProfile ? DefaultProfile->MusicVolume    : 0.4f;
++		FLOAT FxVol    = DefaultProfile ? DefaultProfile->SoundFXVolume  : 0.8f;
++		FLOAT VoiceVol = DefaultProfile ? DefaultProfile->VoiceVolume    : 0.8f;
++		FString SourceTag = TEXT("class defaults");
++
++		if( GLoadSaveManager )
++		{
++			TArray<FString> ProfileNames;
++			if( UPlayerProfile::ListProfiles( &ProfileNames ) && ProfileNames.Num() > 0 )
++			{
++				UPlayerProfile* TempProfile = ConstructObject<UPlayerProfile>( UPlayerProfile::StaticClass() );
++				if( TempProfile && TempProfile->LoadProfile( ProfileNames(0) ) )
++				{
++					MusicVol  = TempProfile->MusicVolume;
++					FxVol     = TempProfile->SoundFXVolume;
++					VoiceVol  = TempProfile->VoiceVolume;
++					SourceTag = FString::Printf( TEXT("saved profile '%s'"), *ProfileNames(0) );
++				}
++			}
++		}
++
++		debugf( NAME_Init, TEXT("ALAudio: seeding category volumes from %s: Music=%f FX=%f Voice=%f"),
++			*SourceTag, MusicVol, FxVol, VoiceVol );
++		SetCategoryVolume( UAudioSubsystem::VOLUME_Music, MusicVol );
++		SetCategoryVolume( UAudioSubsystem::VOLUME_FX,    FxVol );
++		SetCategoryVolume( UAudioSubsystem::VOLUME_Voice, VoiceVol );
++	}
++
++	// Dedicated music source -- separate from the SFX pool so SFX can't
++	// evict the song. 2D / listener-relative.
++	p_alGenSources( 1, &MusicSource );
++	if( p_alGetError() == 0 && p_alSourcei )
++	{
++		p_alSourcei( MusicSource, AL_SOURCE_RELATIVE, AL_TRUE );
++		p_alSource3f( MusicSource, AL_POSITION, 0.f, 0.f, 0.f );
++		p_alSourcei( MusicSource, AL_LOOPING, AL_TRUE );
++	}
++
++	// Allocate the OpenAL source pool. 16 slots is enough headroom for
++	// menus + simultaneous gameplay SFX without the LRU evictor working
++	// hard. Sources stay alive for the session; PlaySoundCue picks the
++	// first AL_STOPPED slot or evicts the oldest InUse one if all busy.
++	{
++		ALuint Sources[MAX_AL_SOURCES];
++		p_alGenSources( MAX_AL_SOURCES, Sources );
++		ALenum Err = p_alGetError();
++		if( Err == 0 /*AL_NO_ERROR*/ )
++		{
++			SourcePool.Empty();
++			for( INT i = 0; i < MAX_AL_SOURCES; i++ )
++			{
++				FALSource S;
++				S.Source   = Sources[i];
++				S.CueName  = NAME_None;
++				S.Actor    = NULL;
++				S.InUse    = 0;
++				S.bAmbient = 0;
++				SourcePool.AddItem( S );
++			}
++			debugf( NAME_Init, TEXT("ALAudio: allocated %d OpenAL sources"), SourcePool.Num() );
++		}
++		else
++		{
++			debugf( NAME_Init, TEXT("ALAudio: alGenSources failed (alGetError=%d)"), Err );
++		}
++	}
++
++	return 1;
++	unguard;
++}
++
++void UALAudioSubsystem::SetViewport( UViewport* InViewport )
++{
++	guard(UALAudioSubsystem::SetViewport);
++	Viewport = InViewport;
++	unguard;
++}
++
++UBOOL UALAudioSubsystem::Exec( const TCHAR* Cmd, FOutputDevice& Ar )
++{
++	guard(UALAudioSubsystem::Exec);
++	return 0;
++	unguard;
++}
++
++// Reclaim sources that finished playing since the last poll. Called from
++// Update() and FindFreeSourceSlot() so we don't accumulate stale InUse
++// slots that block new PlaySoundCue calls. Ambient (looping) sources are
++// never auto-reaped -- they only stop on explicit replay/stop calls.
++void ReapStoppedSources( TArray<UALAudioSubsystem::FALSource>& Pool )
++{
++	if( !p_alGetSourcei ) return;
++	for( INT i = 0; i < Pool.Num(); i++ )
++	{
++		if( !Pool(i).InUse ) continue;
++		if( Pool(i).bAmbient ) continue;
++		ALint State = 0;
++		p_alGetSourcei( Pool(i).Source, AL_SOURCE_STATE, &State );
++		if( State == AL_STOPPED || State == AL_INITIAL )
++		{
++			Pool(i).InUse   = 0;
++			Pool(i).CueName = NAME_None;
++			Pool(i).Actor   = NULL;
++			Pool(i).bAmbient = 0;
++		}
++	}
++}
++
++INT UALAudioSubsystem::FindFreeSourceSlot()
++{
++	guard(UALAudioSubsystem::FindFreeSourceSlot);
++	ReapStoppedSources( SourcePool );
++	for( INT i = 0; i < SourcePool.Num(); i++ )
++		if( !SourcePool(i).InUse )
++			return i;
++	// All busy. Round-robin the eviction index so we don't keep stealing
++	// the same slot (which made one specific channel get clobbered every
++	// time -- weapons in particular went silent under heavy ambients).
++	// Priority-based eviction lands in v2 alongside spatial positioning.
++	if( SourcePool.Num() > 0 && p_alSourceStop )
++	{
++		static INT NextEvict = 0;
++		INT Slot = NextEvict % SourcePool.Num();
++		NextEvict = (NextEvict + 1) % SourcePool.Num();
++		p_alSourceStop( SourcePool(Slot).Source );
++		SourcePool(Slot).InUse    = 0;
++		SourcePool(Slot).CueName  = NAME_None;
++		SourcePool(Slot).Actor    = NULL;
++		SourcePool(Slot).bAmbient = 0;
++		return Slot;
++	}
++	return INDEX_NONE;
++	unguard;
++}
++
++ALuint UALAudioSubsystem::GetOrLoadBuffer( const FString& CueKey, const FCueDef& Def )
++{
++	guard(UALAudioSubsystem::GetOrLoadBuffer);
++	ALuint* Cached = BufferCache.Find( *CueKey );
++	if( Cached )
++		return *Cached;
++
++	TArray<BYTE> WavData;
++	if( !appLoadFileToArray( WavData, *Def.WavPath ) )
++	{
++		debugf( NAME_DevSound, TEXT("ALAudio: PlaySoundCue %s -- wav not found at %s"), *CueKey, *Def.WavPath );
++		return 0;
++	}
++
++	FWaveModInfo Info;
++	if( !Info.ReadWaveInfo( WavData ) )
++	{
++		debugf( NAME_DevSound, TEXT("ALAudio: PlaySoundCue %s -- ReadWaveInfo failed for %s"), *CueKey, *Def.WavPath );
++		return 0;
++	}
++
++	ALenum Format = AL_NONE;
++	if(      *Info.pChannels == 1 && *Info.pBitsPerSample ==  8 ) Format = AL_FORMAT_MONO8;
++	else if( *Info.pChannels == 1 && *Info.pBitsPerSample == 16 ) Format = AL_FORMAT_MONO16;
++	else if( *Info.pChannels == 2 && *Info.pBitsPerSample ==  8 ) Format = AL_FORMAT_STEREO8;
++	else if( *Info.pChannels == 2 && *Info.pBitsPerSample == 16 ) Format = AL_FORMAT_STEREO16;
++	if( Format == AL_NONE )
++	{
++		debugf( NAME_DevSound, TEXT("ALAudio: PlaySoundCue %s -- unsupported format (%d ch, %d bits)"),
++			*CueKey, *Info.pChannels, *Info.pBitsPerSample );
++		return 0;
++	}
++
++	ALuint Buffer = 0;
++	p_alGenBuffers( 1, &Buffer );
++	p_alBufferData( Buffer, Format, Info.SampleDataStart, Info.SampleDataSize, *Info.pSamplesPerSec );
++	if( p_alGetError() != 0 )
++	{
++		p_alDeleteBuffers( 1, &Buffer );
++		debugf( NAME_DevSound, TEXT("ALAudio: alBufferData failed for %s"), *CueKey );
++		return 0;
++	}
++
++	BufferCache.Set( *CueKey, Buffer );
++	return Buffer;
++	unguard;
++}
++
++void UALAudioSubsystem::Update()
++{
++	guard(UALAudioSubsystem::Update);
++	ReapStoppedSources( SourcePool );
++
++	// Run the XACT-style ADSR pitch envelope on each source that
++	// declared one. Stages: 0..Delay = no modulation; Delay..+Attack
++	// ramp up to PitchScaleCents; Hold; Decay down to Sustain%; held
++	// at sustain. Release is on stop and isn't run here.
++	if( p_alSourcef )
++	{
++		DOUBLE Now = appSeconds();
++		for( INT i = 0; i < SourcePool.Num(); i++ )
++		{
++			if( !SourcePool(i).InUse ) continue;
++			if( !SourcePool(i).bHasPitchEG ) continue;
++			INT t = (INT)((Now - SourcePool(i).StartTime) * 1000.0);
++			INT t1 = SourcePool(i).EG_Delay;
++			INT t2 = t1 + SourcePool(i).EG_Attack;
++			INT t3 = t2 + SourcePool(i).EG_Hold;
++			INT t4 = t3 + SourcePool(i).EG_Decay;
++			FLOAT Cents = 0.f;
++			FLOAT Peak  = (FLOAT)SourcePool(i).PitchScaleCents;
++			FLOAT SustainFrac = SourcePool(i).EG_Sustain * 0.01f;
++			if( t < t1 )
++				Cents = 0.f;
++			else if( t < t2 && SourcePool(i).EG_Attack > 0 )
++				Cents = Peak * ((FLOAT)(t - t1)) / SourcePool(i).EG_Attack;
++			else if( t < t3 )
++				Cents = Peak;
++			else if( t < t4 && SourcePool(i).EG_Decay > 0 )
++				Cents = Peak * (1.f - (1.f - SustainFrac) * ((FLOAT)(t - t3)) / SourcePool(i).EG_Decay);
++			else
++				Cents = Peak * SustainFrac;
++			// Cents to ratio: 2^(c/1200).
++			FLOAT Ratio = appPow( 2.f, Cents / 1200.f );
++			p_alSourcef( SourcePool(i).Source, AL_PITCH, Ratio );
++		}
++	}
++
++	// Track each 3D-positioned source to its emitting actor's current
++	// location. Without this, looping sounds on a moving actor (the
++	// minigun's ambient FireLoop being the obvious case) play from where
++	// the actor was at PlaySoundCue time, not where it actually is.
++	// Stop sources whose actor was destroyed (bDeleteMe) so we don't
++	// dereference freed memory next frame.
++	if( p_alSource3f )
++	{
++		for( INT i = 0; i < SourcePool.Num(); i++ )
++		{
++			if( !SourcePool(i).InUse ) continue;
++			// One-shots are short-lived and their position was baked at
++			// PlaySoundCue time -- don't dereference their actor pointer
++			// each frame, that's how stale pointers from across a level
++			// transition GPF us. NotifyLevelChange() clears the pool, but
++			// individual mid-level actor destruction without bDeleteMe is
++			// still possible. Ambient/looping sources have to track to
++			// keep up with moving emitters (minigun fire loop etc.).
++			if( !SourcePool(i).bAmbient ) continue;
++			AActor* A = SourcePool(i).Actor;
++			if( !A ) continue;
++			if( A->bDeleteMe )
++			{
++				p_alSourceStop( SourcePool(i).Source );
++				SourcePool(i).InUse    = 0;
++				SourcePool(i).bAmbient = 0;
++				SourcePool(i).CueName  = NAME_None;
++				SourcePool(i).Actor    = NULL;
++				continue;
++			}
++			// UE2 -> OpenAL coord transform (X right, Y up, Z back).
++			FLOAT ax =  A->Location.Y;
++			FLOAT ay =  A->Location.Z;
++			FLOAT az = -A->Location.X;
++			p_alSource3f( SourcePool(i).Source, AL_POSITION, ax, ay, az );
++		}
++	}
++
++	// Listener position + orientation from the player's pawn (or
++	// controller as a fallback). Without this the listener stays at
++	// the world origin and 3D-positioned sources sound miles away.
++	if( Viewport && Viewport->Actor )
++	{
++		AActor* Listener = Viewport->Actor;
++		// Prefer the pawn's physical location if available -- the
++		// PlayerController sits at the same place but the pawn's the
++		// right "ear" for footsteps and weapon impacts.
++		if( Listener->IsA(APlayerController::StaticClass())
++		 && ((APlayerController*)Listener)->Pawn != NULL )
++			Listener = ((APlayerController*)Listener)->Pawn;
++
++		FVector L = Listener->Location;
++		FRotator R = Listener->Rotation;
++		// UE2 -> OpenAL coord transform (see PlaySoundCue).
++		FLOAT lx =  L.Y, ly =  L.Z, lz = -L.X;
++		p_alListener3f( AL_POSITION, lx, ly, lz );
++
++		// Orientation: forward + up vectors. UE2 Rotator -> direction
++		// via ::Vector(); cross with up axis to get the up basis.
++		FVector Fwd = R.Vector();
++		FLOAT fx =  Fwd.Y, fy =  Fwd.Z, fz = -Fwd.X;
++		// World up (UE2 +Z) -> OpenAL +Y.
++		FLOAT ori[6] = { fx, fy, fz, 0.f, 1.f, 0.f };
++		p_alListenerfv( AL_ORIENTATION, ori );
++	}
++	unguard;
++}
++
++// Build the uppercase key form for a cue lookup. Cues are keyed by their
++// dot-separated, uppercased string form (see ALCueTable.cpp comment for
++// why we sidestep FName).
++static FString CueKey( FName SoundCue )
++{
++	FString S = FString( *SoundCue );
++	for( INT i = 0; i < S.Len(); i++ )
++	{
++		TCHAR c = S[i];
++		if( c >= TEXT('a') && c <= TEXT('z') )
++			S[i] = c - TEXT('a') + TEXT('A');
++	}
++	return S;
++}
++
++// Some UnrealScript cue references are 3-part Package.Group.Name (e.g.
++// FireSound=A_Weapon.FlakCannon.FC_Fire) but the .xap only stores 2-part
++// Bank\Sound (A_Weapon\FC_Fire). Strip the middle group segment and
++// retry the table lookup.
++static FCueDef* FindCueWithGroupFallback( TMap<FString,FCueDef>& Cues, FName SoundCue, FString& outKey )
++{
++	outKey = CueKey( SoundCue );
++	FCueDef* Def = Cues.Find( *outKey );
++	if( Def )
++		return Def;
++
++	INT FirstDot = outKey.InStr( TEXT(".") );
++	INT LastDot  = outKey.InStr( TEXT("."), 1 /*Right*/ );
++	if( FirstDot < 0 || LastDot <= FirstDot )
++		return NULL;
++
++	FString TwoPart = outKey.Left(FirstDot) + TEXT(".") + outKey.Mid(LastDot+1);
++	Def = Cues.Find( *TwoPart );
++	if( Def )
++		outKey = TwoPart;
++	return Def;
++}
++
++void UALAudioSubsystem::PlaySoundCue( AActor* SrcActor, FName SoundCue, UBOOL bAmbient, FLOAT Volume )
++{
++	guard(UALAudioSubsystem::PlaySoundCue);
++
++	if( SourcePool.Num() == 0 )
++		return;
++
++	// Ambients have a single slot per actor: stop the previous one before
++	// starting (or just stopping, when SoundCue==NAME_None).
++	if( bAmbient && SrcActor )
++	{
++		for( INT i = 0; i < SourcePool.Num(); i++ )
++		{
++			if( SourcePool(i).InUse
++			 && SourcePool(i).bAmbient
++			 && SourcePool(i).Actor == SrcActor )
++			{
++				p_alSourceStop( SourcePool(i).Source );
++				SourcePool(i).InUse    = 0;
++				SourcePool(i).bAmbient = 0;
++				SourcePool(i).CueName  = NAME_None;
++				SourcePool(i).Actor    = NULL;
++			}
++		}
++		if( SoundCue == NAME_None )
++			return;
++	}
++
++	FString MatchedKey;
++	FCueDef* Def = FindCueWithGroupFallback( Cues, SoundCue, MatchedKey );
++	debugf( NAME_Log, TEXT("ALAudio: PlaySoundCue cue='%s' bAmbient=%d -> %s"),
++		*SoundCue, bAmbient, Def ? TEXT("HIT") : TEXT("MISS") );
++	if( !Def )
++		return;
++
++	ALuint Buffer = GetOrLoadBuffer( MatchedKey, *Def );
++	if( Buffer == 0 )
++		return;
++
++	INT Slot = FindFreeSourceSlot();
++	if( Slot == INDEX_NONE )
++		return;
++
++	// Compute final gain. Volume in the .xap is millibels (negative =
++	// quieter); 100 mB = 1 dB. Convert to a linear multiplier:
++	// linear = 10^(mB / 2000). Cap to [0, 1] (positive Volume args from
++	// PlaySoundCue scale the cue's base volume up; 0/default = use cue's
++	// baseline only).
++	FLOAT CueLinear = appPow( 10.f, Def->VolumeMillibel / 2000.f );
++	FLOAT CategoryGain = (Def->Category < UAudioSubsystem::VOLUME_Max)
++		? CategoryVolumes[Def->Category] : 1.f;
++	FLOAT VolumeArg = (Volume > 0.f) ? Volume : 1.f;
++	FLOAT FinalGain = Clamp( CueLinear * CategoryGain * VolumeArg, 0.f, 1.f );
++
++	ALuint Source = SourcePool(Slot).Source;
++	p_alSourcei( Source, AL_BUFFER, (ALint)Buffer );
++	p_alSourcef( Source, AL_GAIN, FinalGain );
++	p_alSourcei( Source, AL_LOOPING, bAmbient ? AL_TRUE : AL_FALSE );
++
++	// Spatial setup. UE2 world units are ~2 cm/UU; reference distance
++	// (full volume radius) ~100 UU, max distance / cutoff scaled from
++	// the cue's declared radius (defaults to 2500 UU per UnAudio.h).
++	// 2D-only cues (UI, music) are flagged via NULL SrcActor or the
++	// Music category; play those listener-relative at origin so they
++	// stay 2D regardless of listener position.
++	UBOOL b2D = (SrcActor == NULL) || (Def->Category == UAudioSubsystem::VOLUME_Music);
++	if( b2D )
++	{
++		p_alSourcei( Source, AL_SOURCE_RELATIVE, AL_TRUE );
++		p_alSource3f( Source, AL_POSITION, 0.f, 0.f, 0.f );
++	}
++	else
++	{
++		// Convert UE2 (X forward, Y right, Z up, left-handed) -> OpenAL
++		// (X right, Y up, Z back, right-handed):
++		//   AL.x =  UE.y    AL.y = UE.z    AL.z = -UE.x
++		FLOAT ax =  SrcActor->Location.Y;
++		FLOAT ay =  SrcActor->Location.Z;
++		FLOAT az = -SrcActor->Location.X;
++		p_alSourcei( Source, AL_SOURCE_RELATIVE, AL_FALSE );
++		p_alSource3f( Source, AL_POSITION, ax, ay, az );
++		p_alSourcef( Source, AL_REFERENCE_DISTANCE, 100.f );
++		p_alSourcef( Source, AL_ROLLOFF_FACTOR, 1.f );
++		p_alSourcef( Source, AL_MAX_DISTANCE, 2500.f );
++	}
++
++	p_alSourcePlay( Source );
++
++	SourcePool(Slot).InUse           = 1;
++	SourcePool(Slot).CueName         = SoundCue;
++	SourcePool(Slot).Actor           = SrcActor;
++	SourcePool(Slot).bAmbient        = bAmbient ? 1 : 0;
++	SourcePool(Slot).bHasPitchEG     = Def->bHasPitchEG;
++	SourcePool(Slot).EG_Delay        = Def->EG_Delay;
++	SourcePool(Slot).EG_Attack       = Def->EG_Attack;
++	SourcePool(Slot).EG_Hold         = Def->EG_Hold;
++	SourcePool(Slot).EG_Decay        = Def->EG_Decay;
++	SourcePool(Slot).EG_Sustain      = Def->EG_Sustain;
++	SourcePool(Slot).PitchScaleCents = Def->PitchScaleCents;
++	SourcePool(Slot).StartTime       = appSeconds();
++
++	// Always reset pitch -- a recycled source could carry leftover
++	// AL_PITCH from a previous cue's envelope, which would make the
++	// next sound on this slot play at the wrong pitch (the user heard
++	// "some high pitches higher than the original, sometimes" -- that
++	// was a slot-recycling carryover, not the envelope itself).
++	p_alSourcef( Source, AL_PITCH, 1.f );
++
++	unguard;
++}
++
++void UALAudioSubsystem::StopSoundCue( AActor* SrcActor, FName SoundCue )
++{
++	guard(UALAudioSubsystem::StopSoundCue);
++	for( INT i = 0; i < SourcePool.Num(); i++ )
++	{
++		if( SourcePool(i).InUse
++		 && SourcePool(i).Actor   == SrcActor
++		 && SourcePool(i).CueName == SoundCue )
++		{
++			p_alSourceStop( SourcePool(i).Source );
++			SourcePool(i).InUse    = 0;
++			SourcePool(i).CueName  = NAME_None;
++			SourcePool(i).Actor    = NULL;
++			SourcePool(i).bAmbient = 0;
++		}
++	}
++	unguard;
++}
++
++void UALAudioSubsystem::StopSoundCues( AActor* SrcActor )
++{
++	guard(UALAudioSubsystem::StopSoundCues);
++	for( INT i = 0; i < SourcePool.Num(); i++ )
++	{
++		if( SourcePool(i).InUse && SourcePool(i).Actor == SrcActor )
++		{
++			p_alSourceStop( SourcePool(i).Source );
++			SourcePool(i).InUse    = 0;
++			SourcePool(i).CueName  = NAME_None;
++			SourcePool(i).Actor    = NULL;
++			SourcePool(i).bAmbient = 0;
++		}
++	}
++	unguard;
++}
++
++FLOAT UALAudioSubsystem::GetSoundCueDuration( FName SoundCue )
++{
++	guard(UALAudioSubsystem::GetSoundCueDuration);
++	return 1.5f;
++	unguard;
++}
++
++FLOAT UALAudioSubsystem::GetSoundCueRadius( FName SoundCue )
++{
++	guard(UALAudioSubsystem::GetSoundCueRadius);
++	return 2500.f;
++	unguard;
++}
++
++FLOAT UALAudioSubsystem::GetCategoryVolume( EVolumeCategory Category )
++{
++	guard(UALAudioSubsystem::GetCategoryVolume);
++	if( Category < 0 || Category >= UAudioSubsystem::VOLUME_Max )
++		return 0.f;
++	return CategoryVolumes[Category];
++	unguard;
++}
++
++void UALAudioSubsystem::SetCategoryVolume( EVolumeCategory Category, FLOAT NewVolume )
++{
++	guard(UALAudioSubsystem::SetCategoryVolume);
++	if( Category < 0 || Category >= UAudioSubsystem::VOLUME_Max )
++		return;
++	CategoryVolumes[Category] = NewVolume;
++
++	// Music is a single long-lived AL source: PlayMusic stamps AL_GAIN
++	// once at start, so without this re-apply the options slider has no
++	// effect until the next track change. SFX/Voice are stamped at
++	// PlaySoundCue time and live for a fraction of a second, so the next
++	// sound naturally picks up the new value -- nothing to do for them.
++	if( Category == UAudioSubsystem::VOLUME_Music
++		&& MusicSource && p_alSourcef )
++	{
++		p_alSourcef( MusicSource, AL_GAIN, NewVolume );
++	}
++
++	unguard;
++}
++
++INT UALAudioSubsystem::PlayMusic( FString Song, FLOAT FadeInTime )
++{
++	guard(UALAudioSubsystem::PlayMusic);
++
++	// Empty song / "None" stops current music.
++	if( Song.Len() == 0 || Song == TEXT("None") )
++	{
++		StopAllMusic( 0.f );
++		return 0;
++	}
++
++	// Already playing this song -- do nothing, return existing handle.
++	if( CurrentMusicHandle && CurrentMusicSong == Song )
++		return CurrentMusicHandle;
++
++	if( !p_alSourceStop || !p_alGenBuffers )
++		return 0;
++
++	// Stop and free the previous music buffer/source binding.
++	if( CurrentMusicHandle )
++	{
++		p_alSourceStop( MusicSource );
++		p_alSourcei( MusicSource, AL_BUFFER, 0 );
++		if( MusicBuffer )
++		{
++			p_alDeleteBuffers( 1, &MusicBuffer );
++			MusicBuffer = 0;
++		}
++		CurrentMusicHandle = 0;
++		CurrentMusicSong = TEXT("");
++	}
++
++	// Load Music/<Song>.wav. The .wma sibling is ignored on PC -- every
++	// .wma in the tree has a paired .wav.
++	FString WavPath = FString::Printf( TEXT("..\\Music\\%s.wav"), *Song );
++	TArray<BYTE> WavData;
++	if( !appLoadFileToArray( WavData, *WavPath ) )
++	{
++		debugf( NAME_DevSound, TEXT("ALAudio: PlayMusic: wav not found at %s"), *WavPath );
++		return 0;
++	}
++
++	FWaveModInfo Info;
++	if( !Info.ReadWaveInfo( WavData ) )
++	{
++		debugf( NAME_DevSound, TEXT("ALAudio: PlayMusic: ReadWaveInfo failed for %s"), *WavPath );
++		return 0;
++	}
++
++	ALenum Format = AL_NONE;
++	if(      *Info.pChannels == 1 && *Info.pBitsPerSample ==  8 ) Format = AL_FORMAT_MONO8;
++	else if( *Info.pChannels == 1 && *Info.pBitsPerSample == 16 ) Format = AL_FORMAT_MONO16;
++	else if( *Info.pChannels == 2 && *Info.pBitsPerSample ==  8 ) Format = AL_FORMAT_STEREO8;
++	else if( *Info.pChannels == 2 && *Info.pBitsPerSample == 16 ) Format = AL_FORMAT_STEREO16;
++	if( Format == AL_NONE )
++		return 0;
++
++	p_alGenBuffers( 1, &MusicBuffer );
++	p_alBufferData( MusicBuffer, Format, Info.SampleDataStart, Info.SampleDataSize, *Info.pSamplesPerSec );
++	p_alSourcei( MusicSource, AL_BUFFER, (ALint)MusicBuffer );
++	p_alSourcef( MusicSource, AL_PITCH, 1.f );
++	p_alSourcef( MusicSource, AL_GAIN, CategoryVolumes[UAudioSubsystem::VOLUME_Music] );
++	p_alSourcePlay( MusicSource );
++
++	CurrentMusicHandle = NextMusicHandle++;
++	CurrentMusicSong = Song;
++	debugf( NAME_Log, TEXT("ALAudio: PlayMusic '%s' (handle=%d, %d Hz, %d ch)"),
++		*Song, CurrentMusicHandle, *Info.pSamplesPerSec, *Info.pChannels );
++	return CurrentMusicHandle;
++	unguard;
++}
++
++UBOOL UALAudioSubsystem::StopMusic( INT SongHandle, FLOAT FadeOutTime )
++{
++	guard(UALAudioSubsystem::StopMusic);
++	if( SongHandle == 0 || SongHandle != CurrentMusicHandle )
++		return 0;
++	StopAllMusic( FadeOutTime );
++	return 1;
++	unguard;
++}
++
++INT UALAudioSubsystem::StopAllMusic( FLOAT FadeOutTime )
++{
++	guard(UALAudioSubsystem::StopAllMusic);
++	if( !p_alSourceStop || CurrentMusicHandle == 0 )
++		return 0;
++	p_alSourceStop( MusicSource );
++	p_alSourcei( MusicSource, AL_BUFFER, 0 );
++	if( MusicBuffer && p_alDeleteBuffers )
++	{
++		p_alDeleteBuffers( 1, &MusicBuffer );
++		MusicBuffer = 0;
++	}
++	CurrentMusicHandle = 0;
++	CurrentMusicSong = TEXT("");
++	return 0;
++	unguard;
++}
++
++void UALAudioSubsystem::NoteDestroy( AActor* Actor )
++{
++	guard(UALAudioSubsystem::NoteDestroy);
++	if( !Actor ) return;
++	for( INT i = 0; i < SourcePool.Num(); i++ )
++	{
++		if( SourcePool(i).InUse && SourcePool(i).Actor == Actor )
++		{
++			p_alSourceStop( SourcePool(i).Source );
++			SourcePool(i).InUse    = 0;
++			SourcePool(i).bAmbient = 0;
++			SourcePool(i).CueName  = NAME_None;
++			SourcePool(i).Actor    = NULL;
++		}
++	}
++	unguard;
++}
++
++UViewport* UALAudioSubsystem::GetViewport()
++{
++	guard(UALAudioSubsystem::GetViewport);
++	return Viewport;
++	unguard;
++}
++
++void UALAudioSubsystem::CleanUp()
++{
++	guard(UALAudioSubsystem::CleanUp);
++	unguard;
++}
++
++void UALAudioSubsystem::NotifyLevelChange()
++{
++	guard(UALAudioSubsystem::NotifyLevelChange);
++	// Every cached SourcePool(i).Actor is a raw pointer into the level
++	// that's about to be torn down. Without stopping them here, Update()
++	// next frame walks the pool, dereferences A->bDeleteMe on freed
++	// memory and GPFs (seen on first menu.unr load).
++	for( INT i = 0; i < SourcePool.Num(); i++ )
++	{
++		if( SourcePool(i).InUse && p_alSourceStop )
++			p_alSourceStop( SourcePool(i).Source );
++		SourcePool(i).InUse    = 0;
++		SourcePool(i).bAmbient = 0;
++		SourcePool(i).CueName  = NAME_None;
++		SourcePool(i).Actor    = NULL;
++	}
++	unguard;
++}
++
++void UALAudioSubsystem::NotifyZoneChange( AZoneInfo* NewZone )
++{
++	guard(UALAudioSubsystem::NotifyZoneChange);
++	unguard;
++}
++
++void UALAudioSubsystem::NotifyPauseChange( UBOOL bNowPaused )
++{
++	guard(UALAudioSubsystem::NotifyPauseChange);
++	unguard;
++}
++
++// PC port: ducking hook for fullscreen cutscene playback (D3DDrv's
++// D3DMoviePlayback). Pauses the engine's music + in-flight SFX so the
++// movie's own audio track is audible. Resumes on un-duck.
++//
++// In-game video TEXTURES (loading screens, UI overlays) deliberately do
++// NOT call this -- they coexist with regular game audio. Only the
++// fullscreen-cutscene path calls duck.
++//
++// Called via GetProcAddress("UCMovieAudioDuck") from D3DDrv so we don't
++// need a static link from D3DDrv to ALAudio.
++//
++// bDucked=1 -> pause everything currently playing.
++// bDucked=0 -> resume.
++
++extern "C" __declspec(dllexport) void UCMovieAudioDuck( int bDucked )
++{
++	if( !GALAudio || !p_alSourcePause || !p_alSourcePlay )
++		return;
++	if( bDucked )
++	{
++		if( GALAudio->MusicSource )
++			p_alSourcePause( GALAudio->MusicSource );
++		for( INT i = 0; i < GALAudio->SourcePool.Num(); i++ )
++		{
++			UALAudioSubsystem::FALSource& s = GALAudio->SourcePool(i);
++			if( s.InUse )
++				p_alSourcePause( s.Source );
++		}
++	}
++	else
++	{
++		if( GALAudio->MusicSource )
++			p_alSourcePlay( GALAudio->MusicSource );
++		for( INT i = 0; i < GALAudio->SourcePool.Num(); i++ )
++		{
++			UALAudioSubsystem::FALSource& s = GALAudio->SourcePool(i);
++			if( s.InUse )
++				p_alSourcePlay( s.Source );
++		}
++	}
++}
++
++// PC port: query the engine's per-category audio volume from outside
++// ALAudio. Used by D3DMoviePlayback to apply the user's "music" slider
++// to its OpenAL source so cutscenes respect the same volume the rest of
++// the music does. Categories are UAudioSubsystem::EVolumeCategory:
++//   0 = music, 1 = sfx, 2 = voice, 3 = voice-chat.
++extern "C" __declspec(dllexport) float UCMovieGetCategoryVolume( int category )
++{
++	if( !GALAudio )
++		return 1.0f;
++	if( category < 0 || category >= UAudioSubsystem::VOLUME_Max )
++		return 1.0f;
++	return GALAudio->GetCategoryVolume( (UAudioSubsystem::EVolumeCategory)category );
++}

@@ -1,0 +1,25 @@
+diff --git a/UC2004/Editor/Src/UnScrCom.cpp b/UC2004/Editor/Src/UnScrCom.cpp
+index b089b0df..38ae6e53 100644
+--- a/UC2004/Editor/Src/UnScrCom.cpp
++++ b/UC2004/Editor/Src/UnScrCom.cpp
+@@ -7319,8 +7319,18 @@ UBOOL UEditorEngine::MakeScripts( UClass* BaseClass, FFeedbackContext* Warn, UBO
+ 		debugf( NAME_DevCompile, TEXT("DowngradeClasses:") );
+ 	for( TArray<UClass*>::TIterator It(AllClasses); It; ++It )
+ 	{
+-		if ((*It)->ScriptText &&
+-		    ((*It)->Dependencies.Num()==0 || (*It)->GetScriptTextCRC()!=(*It)->Dependencies(0).ScriptTextCRC || MakeAll) )
++		// vs2003-port fix: classes declared `native noexport` (Object, Subsystem,
++		// Engine, ...) deserialize from .u with a 1-char stub UTextBuffer; their
++		// real .uc source isn't round-tripped through the package. The original
++		// condition CRCs that stub, never matches the stored CRC of the original
++		// .uc, and clears CLASS_Parsed on every native-noexport class -- the
++		// subsequent parse then fails at "Missing 'Class' definition" because
++		// the stub really is empty. Skip CRC-based downgrade when ScriptText is
++		// the noexport stub: trust the CLASS_Parsed flag from .u deserialization.
++		UBOOL bHasRealScriptText = (*It)->ScriptText && (*It)->ScriptText->Text.Len() > 1;
++		if (bHasRealScriptText &&
++		    ( MakeAll ||
++		      ((*It)->Dependencies.Num()>0 && (*It)->GetScriptTextCRC()!=(*It)->Dependencies(0).ScriptTextCRC) ) )
+ 		{
+ 			if( Compiler.ShowDep )
+ 			{

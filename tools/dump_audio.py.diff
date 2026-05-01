@@ -1,0 +1,192 @@
+diff --git a/tools/dump_audio.py b/tools/dump_audio.py
+new file mode 100644
+index 00000000..1927580e
+--- /dev/null
++++ b/tools/dump_audio.py
+@@ -0,0 +1,186 @@
++#!/usr/bin/env python3
++"""Dump every Cue in UC2004/Sounds/Avaris.xap to audio_dump/<Cue.Name>.wav.
++
++The XACT project file (Avaris.xap) is plain text. It declares Wave Banks
++(collections of .wav files), Sound Banks (with Sound entries that reference
++wave entries via Track > Registered Wave), and Cue blocks (gameplay-facing
++identifiers that reference Sounds). For the simple v1 case every chain
++collapses to Cue -> Sound -> WaveEntry -> a single .wav under SoundData/.
++
++This script:
++  1. Tokenizes Avaris.xap into nested {type, attrs, children} blocks.
++  2. Indexes wave entries by (wave-bank-name, entry-name) -> file path.
++  3. Indexes sounds by sound-name -> [wave-entry refs].
++  4. Walks every Cue, resolves the first sound and first wave entry,
++     and copies the source .wav to audio_dump/<Cue.Name>.wav.
++  5. Prints stats covering: total cues, copied, missing source .wav,
++     cues with multiple Sound refs, sounds with multiple Tracks.
++
++Run from repo root:
++    python tools/dump_audio.py
++"""
++
++import os
++import shutil
++import sys
++import time
++
++REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
++XAP_PATH  = os.path.join(REPO_ROOT, "UC2004", "Sounds", "Avaris.xap")
++SOUNDS_DIR = os.path.dirname(XAP_PATH)
++DUMP_DIR  = os.path.join(REPO_ROOT, "audio_dump")
++
++
++def parse_xap(path):
++    """Parse the .xap text into a tree of {type, attrs, children} dicts."""
++    with open(path, "r", encoding="utf-8") as f:
++        lines = f.readlines()
++
++    root = {"type": "<root>", "attrs": {}, "children": []}
++    stack = [root]
++    pending_type = None
++
++    for raw in lines:
++        s = raw.strip()
++        if not s or s.startswith("//"):
++            continue
++        if s == "{":
++            block = {"type": pending_type or "<anon>", "attrs": {}, "children": []}
++            stack[-1]["children"].append(block)
++            stack.append(block)
++            pending_type = None
++        elif s == "}":
++            if len(stack) > 1:
++                stack.pop()
++        elif "=" in s and s.endswith(";"):
++            k, _, v = s[:-1].partition("=")
++            stack[-1]["attrs"][k.strip()] = v.strip()
++        else:
++            pending_type = s
++
++    return root
++
++
++def find_blocks(node, type_name):
++    """Yield direct children matching type_name."""
++    for child in node["children"]:
++        if child["type"] == type_name:
++            yield child
++
++
++def find_blocks_recursive(node, type_name):
++    for child in node["children"]:
++        if child["type"] == type_name:
++            yield child
++        yield from find_blocks_recursive(child, type_name)
++
++
++def main():
++    t0 = time.time()
++    print(f"Parsing {XAP_PATH} ...")
++    root = parse_xap(XAP_PATH)
++
++    # Index wave bank entries: (bank_name, entry_name) -> file
++    wave_entries = {}
++    for wb in find_blocks(root, "Wave Bank"):
++        bank_name = wb["attrs"].get("Name", "")
++        for entry in find_blocks(wb, "Entry"):
++            entry_name = entry["attrs"].get("Name", "")
++            file_path  = entry["attrs"].get("File", "")
++            wave_entries[(bank_name, entry_name)] = file_path
++
++    # Index sounds: sound_name -> [(wave_bank, wave_entry), ...]
++    sounds = {}
++    for sb in find_blocks(root, "Sound Bank"):
++        for sound in find_blocks(sb, "Sound"):
++            sound_name = sound["attrs"].get("Name", "")
++            waves = []
++            for rw in find_blocks_recursive(sound, "Registered Wave"):
++                wb_name    = rw["attrs"].get("Wave Bank", "")
++                entry_name = rw["attrs"].get("Wave Entry", "")
++                waves.append((wb_name, entry_name))
++            sounds[sound_name] = waves
++
++    # Index cues: cue_name -> [sound_name, ...]
++    cues = {}
++    for sb in find_blocks(root, "Sound Bank"):
++        for cue in find_blocks(sb, "Cue"):
++            cue_name = cue["attrs"].get("Name", "")
++            refs = [c["attrs"].get("Sound", "") for c in find_blocks(cue, "Sound")]
++            cues[cue_name] = refs
++
++    parse_secs = time.time() - t0
++    print(f"  parsed in {parse_secs:.1f}s")
++    print(f"  wave entries: {len(wave_entries)}")
++    print(f"  sounds:       {len(sounds)}")
++    print(f"  cues:         {len(cues)}")
++    print()
++
++    # Dump
++    if not os.path.isdir(DUMP_DIR):
++        os.makedirs(DUMP_DIR)
++
++    copied = 0
++    missing_src = 0
++    no_sound = 0
++    no_wave = 0
++    no_entry = 0
++    multi_sound = 0
++    multi_track = 0
++    name_divergence = 0  # cue name != wave file basename
++
++    for cue_name, sound_refs in cues.items():
++        if len(sound_refs) > 1:
++            multi_sound += 1
++        if not sound_refs:
++            no_sound += 1
++            continue
++        first_sound = sound_refs[0]
++        waves = sounds.get(first_sound, [])
++        if len(waves) > 1:
++            multi_track += 1
++        if not waves:
++            no_wave += 1
++            continue
++        wb_name, entry_name = waves[0]
++        src_rel = wave_entries.get((wb_name, entry_name))
++        if not src_rel:
++            no_entry += 1
++            continue
++
++        # File paths in the .xap are relative to UC2004/Sounds/.
++        abs_src = os.path.normpath(os.path.join(SOUNDS_DIR, src_rel.replace("\\", os.sep)))
++
++        # Output path: audio_dump/<cue_name_with_slashes>.wav
++        cue_path = cue_name.replace("\\", "/")
++        abs_dst = os.path.join(DUMP_DIR, cue_path + ".wav")
++
++        # Track whether cue name and source wav basename diverge.
++        src_basename_no_ext = os.path.splitext(os.path.basename(abs_src))[0]
++        cue_leaf = cue_name.split("\\")[-1]
++        if src_basename_no_ext.lower() != cue_leaf.lower():
++            name_divergence += 1
++
++        if not os.path.isfile(abs_src):
++            missing_src += 1
++            continue
++
++        os.makedirs(os.path.dirname(abs_dst), exist_ok=True)
++        if not os.path.isfile(abs_dst):
++            shutil.copy2(abs_src, abs_dst)
++        copied += 1
++
++    total_secs = time.time() - t0
++    print(f"Dump complete in {total_secs:.1f}s. Output: {DUMP_DIR}")
++    print(f"  copied:                   {copied}")
++    print(f"  missing source .wav:      {missing_src}")
++    print(f"  cues with no sound ref:   {no_sound}")
++    print(f"  cues whose sound has 0 waves: {no_wave}")
++    print(f"  waves with no entry record:   {no_entry}")
++    print(f"  cues w/ multiple Sound refs:  {multi_sound}")
++    print(f"  sounds w/ multiple Tracks:    {multi_track}")
++    print(f"  cue-name vs wav-basename mismatches: {name_divergence}")
++
++
++if __name__ == "__main__":
++    main()

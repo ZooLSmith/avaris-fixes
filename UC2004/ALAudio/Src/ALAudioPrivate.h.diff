@@ -1,0 +1,20 @@
+diff --git a/UC2004/ALAudio/Src/ALAudioPrivate.h b/UC2004/ALAudio/Src/ALAudioPrivate.h
+new file mode 100644
+index 00000000..0f55584b
+--- /dev/null
++++ b/UC2004/ALAudio/Src/ALAudioPrivate.h
+@@ -0,0 +1,14 @@
++/*=============================================================================
++	ALAudioPrivate.h: Project Avaris OpenAL audio package — private header.
++=============================================================================*/
++
++#ifndef _INC_ALAUDIOPRIVATE
++#define _INC_ALAUDIOPRIVATE
++
++// ALAUDIO_API=__declspec(dllexport) is provided by the .vcproj
++// PreprocessorDefinitions for the build itself; the public ALAudio.h
++// only defaults it to DLL_IMPORT when consumers haven't already set it.
++
++#include "ALAudio.h"
++
++#endif

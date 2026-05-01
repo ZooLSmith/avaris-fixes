@@ -1,0 +1,55 @@
+diff --git a/tools/dump_audio_diag.py b/tools/dump_audio_diag.py
+new file mode 100644
+index 00000000..cf5251e7
+--- /dev/null
++++ b/tools/dump_audio_diag.py
+@@ -0,0 +1,49 @@
++"""One-shot diagnostic: sample missing wavs and cue/wav-name divergences."""
++import os, sys
++sys.path.insert(0, os.path.dirname(__file__))
++from dump_audio import parse_xap, find_blocks, find_blocks_recursive, XAP_PATH, SOUNDS_DIR
++
++root = parse_xap(XAP_PATH)
++wave_entries = {}
++for wb in find_blocks(root, "Wave Bank"):
++    bn = wb["attrs"].get("Name", "")
++    for e in find_blocks(wb, "Entry"):
++        wave_entries[(bn, e["attrs"].get("Name", ""))] = e["attrs"].get("File", "")
++sounds = {}
++for sb in find_blocks(root, "Sound Bank"):
++    for s in find_blocks(sb, "Sound"):
++        ws = [(rw["attrs"].get("Wave Bank", ""), rw["attrs"].get("Wave Entry", ""))
++              for rw in find_blocks_recursive(s, "Registered Wave")]
++        sounds[s["attrs"].get("Name", "")] = ws
++
++missing = []
++divergences = []
++for sb in find_blocks(root, "Sound Bank"):
++    for cue in find_blocks(sb, "Cue"):
++        cn = cue["attrs"].get("Name", "")
++        refs = [c["attrs"].get("Sound", "") for c in find_blocks(cue, "Sound")]
++        if not refs:
++            continue
++        ws = sounds.get(refs[0], [])
++        if not ws:
++            continue
++        src = wave_entries.get(ws[0])
++        if not src:
++            continue
++        abs_src = os.path.normpath(os.path.join(SOUNDS_DIR, src.replace("\\", os.sep)))
++        if not os.path.isfile(abs_src):
++            missing.append((cn, abs_src))
++        cue_leaf = cn.split("\\")[-1]
++        wav_leaf = os.path.splitext(os.path.basename(abs_src))[0]
++        if cue_leaf.lower() != wav_leaf.lower():
++            divergences.append((cn, wav_leaf))
++
++print(f"--- missing source wavs ({len(missing)} total, first 12) ---")
++for c, p in missing[:12]:
++    print(f"  cue: {c}")
++    print(f"  src: {p}")
++
++print()
++print(f"--- cue-leaf vs wav-basename mismatches ({len(divergences)} total, first 12) ---")
++for c, w in divergences[:12]:
++    print(f"  cue={c!r}  wav={w!r}")

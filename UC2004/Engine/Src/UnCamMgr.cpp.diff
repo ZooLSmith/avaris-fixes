@@ -1,0 +1,30 @@
+diff --git a/UC2004/Engine/Src/UnCamMgr.cpp b/UC2004/Engine/Src/UnCamMgr.cpp
+index 19beb177..1f8795a7 100644
+--- a/UC2004/Engine/Src/UnCamMgr.cpp
++++ b/UC2004/Engine/Src/UnCamMgr.cpp
+@@ -216,6 +216,25 @@ UBOOL UClient::Exec( const TCHAR* Cmd, FOutputDevice& Ar )
+ 			Viewports(0)->Actor->eventClientMessage( *FString::Printf(TEXT("Gamma %1.1f"), Gamma), NAME_None );
+ 		return 1;
+ 	}
++	// PC port: live-value queries for the VIDEO settings page. The GET
++	// console handler in UnObj.cpp reads class default properties, not
++	// runtime state, and BRIGHTNESS/GAMMA/CONTRAST without args reset
++	// the value -- so the menu had no way to read the current settings.
++	else if( ParseCommand(&Cmd,TEXT("GETBRIGHTNESS")) )
++	{
++		Ar.Logf( TEXT("%f"), Brightness );
++		return 1;
++	}
++	else if( ParseCommand(&Cmd,TEXT("GETCONTRAST")) )
++	{
++		Ar.Logf( TEXT("%f"), Contrast );
++		return 1;
++	}
++	else if( ParseCommand(&Cmd,TEXT("GETGAMMA")) )
++	{
++		Ar.Logf( TEXT("%f"), Gamma );
++		return 1;
++	}
+ 	// scion sz -
+ 	else if( ParseCommand(&Cmd,TEXT("DYNAMICGAMMA")) )
+ 	{

@@ -1,0 +1,95 @@
+diff --git a/UC2004/UCMenu/Classes/UC2Settings_Main.uc b/UC2004/UCMenu/Classes/UC2Settings_Main.uc
+index a1859a7a..ddeb5453 100644
+--- a/UC2004/UCMenu/Classes/UC2Settings_Main.uc
++++ b/UC2004/UCMenu/Classes/UC2Settings_Main.uc
+@@ -3,7 +3,7 @@
+   Main settings menu
+ 
+   Author: Ron Prestenback
+-  © 2004, Epic Games, Inc. All Rights Reserved
++  ï¿½ 2004, Epic Games, Inc. All Rights Reserved
+ ==============================================================================*/
+ 
+ class UC2Settings_Main extends UC2Settings_PageBase;
+@@ -14,7 +14,7 @@ class UC2Settings_Main extends UC2Settings_PageBase;
+ //  Properties
+ // =====================================================================================================================
+ // =====================================================================================================================
+-var() GUILabelButton btn_Rename, btn_Audio, btn_Controller, btn_Game, btn_Advanced;
++var() GUILabelButton btn_Rename, btn_Audio, btn_Video, btn_Controller, btn_Game, btn_Advanced;
+ 
+ final function RenameProfileClosed(GUIPage Menu, bool bCancelled)
+ {
+@@ -60,6 +60,7 @@ function InitOptions()
+ 		pnl_Options.AddItem(btn_Rename);
+ 
+ 	pnl_Options.AddItem( btn_Audio );
++	pnl_Options.AddItem( btn_Video );
+ 	pnl_Options.AddItem( btn_Controller );
+ 	pnl_Options.AddItem( btn_Game );
+ 	pnl_Options.AddItem( btn_Advanced );
+@@ -96,6 +97,10 @@ function CloseComplete( GUIComponent Sender, EAnimationType Type )
+ 		OpenMenu("UCMenu.UC2Settings_Audio");
+ 		break;
+ 
++	case btn_Video:
++		OpenMenu("UCMenu.UC2Settings_Video");
++		break;
++
+ 	case btn_Controller:
+ 		OpenMenu("UCMenu.UC2Settings_Controller");
+ 		break;
+@@ -119,6 +124,7 @@ event Free()
+ {
+ 	btn_Rename = None;
+ 	btn_Audio = None;
++	btn_Video = None;
+ 	btn_Controller = None;
+ 	btn_Game = None;
+ 	btn_Advanced = None;
+@@ -160,6 +166,18 @@ DefaultProperties
+ 	end object
+ 	btn_Audio=AudioButton
+ 
++	begin object class=GUILabelButton name=VideoButton
++		WinWidth=0.429688
++		WinHeight=0.034375
++		WinLeft=0.076563
++		WinTop=256
++		Caption="VIDEO"
++		Hint="CONFIGURE DISPLAY OPTIONS"
++		TabOrder=6
++		OnClick=ButtonClick
++	end object
++	btn_Video=VideoButton
++
+ 	begin object class=GUILabelButton name=ControllerSettingsButton
+ 		WinWidth=0.429688
+ 		WinHeight=0.034375
+@@ -167,7 +185,7 @@ DefaultProperties
+ 		WinTop=256
+ 		Caption="CONTROLLER"
+ 		Hint="CONFIGURE CONTROLLER OPTIONS"
+-		TabOrder=6
++		TabOrder=7
+ 		OnClick=ButtonClick
+ 	end object
+ 	btn_Controller=ControllerSettingsButton
+@@ -179,7 +197,7 @@ DefaultProperties
+ 		WinTop=256
+ 		Caption="GAMEPLAY"
+ 		Hint="CONFIGURE GAMEPLAY OPTIONS"
+-		TabOrder=7
++		TabOrder=8
+ 		OnClick=ButtonClick
+ 	end object
+ 	btn_Game=GameButton
+@@ -191,7 +209,7 @@ DefaultProperties
+ 		WinTop=256
+ 		Caption="ADVANCED"
+ 		Hint="CONFIGURE ADVANCED OPTIONS"
+-		TabOrder=8
++		TabOrder=9
+ 		OnClick=ButtonClick
+ 	End Object
+ 	btn_Advanced=AdvancedButton

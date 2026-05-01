@@ -1,0 +1,28 @@
+diff --git a/UC2004/Core/Inc/FNameDebug.h b/UC2004/Core/Inc/FNameDebug.h
+index 08ff0548..31ee6130 100644
+--- a/UC2004/Core/Inc/FNameDebug.h
++++ b/UC2004/Core/Inc/FNameDebug.h
+@@ -11,10 +11,21 @@ class FNameDebug
+ 	void Release(void);
+ 
+ public:
+-	// Constructs the debugging hook
++	// Constructs the debugging hook.
++	// vs2003-port fix: Init() calls CoCreateInstance(CLSID_FNameDebug) at static-
++	// init time, which only succeeds if FNameDebugCOMps.dll has been registered
++	// system-wide (a one-time `regsvr32 FNameDebugCOMps.dll` step that isn't
++	// part of the runtime distribution). On Windows 10/11 the CoCreateInstance
++	// lookup for an unregistered CLSID can deadlock the calling thread in csrss
++	// /RPCSS IPC during DLL load -- it presents as a 13MB working-set hang with
++	// no log file, no splash, no main window, and the main thread parked in
++	// LpcReplyWaitReceivePort. This COM helper is a Visual Studio debug-
++	// visualizer convenience for inspecting FName values during a debug session;
++	// it's not required for runtime gameplay. Skipping Init() is safe -- the
++	// AddFName / Release methods short-circuit when g_pIFNameDebug is NULL.
+ 	FNameDebug(void)
+ 	{
+-		Init();
++		// Init();  // disabled: modern-Windows CoCreateInstance deadlock during DllMain
+ 	}
+ 
+ 	// Releases all resources

@@ -1,0 +1,184 @@
+diff --git a/UC2004/Engine/Src/UnMaterial.cpp b/UC2004/Engine/Src/UnMaterial.cpp
+index 7026df13..3f9b04db 100644
+--- a/UC2004/Engine/Src/UnMaterial.cpp
++++ b/UC2004/Engine/Src/UnMaterial.cpp
+@@ -9,6 +9,21 @@
+ 
+ #include "EnginePrivate.h"
+ 
++#ifndef _XBOX
++// FMovieTexture's cross-DLL shim into D3DDrv (see lower in this file) needs
++// the Win32 loader API. Including <windows.h> from inside an Unreal source
++// file causes type-redefinition cascades against Core's own typedefs, so
++// forward-declare just the two entry points and the opaque module handle.
++struct HINSTANCE__;
++typedef HINSTANCE__* HMODULE_LOCAL;
++typedef int (__stdcall* FARPROC_LOCAL)();
++extern "C"
++{
++	__declspec(dllimport) HMODULE_LOCAL __stdcall GetModuleHandleA(const char*);
++	__declspec(dllimport) FARPROC_LOCAL __stdcall GetProcAddress(HMODULE_LOCAL, const char*);
++}
++#endif
++
+ /*----------------------------------------------------------------------------
+ 	UMaterial.
+ ----------------------------------------------------------------------------*/
+@@ -1091,9 +1106,54 @@ IMPLEMENT_CLASS(UMovieMaterial);
+  *
+  * This class bridges the layering between Engine and D3DDrv.
+  *
++ * On PC, FMovieTexture is a real FTexture: the engine cache locks the
++ * D3D surface and calls GetTextureData to fill it from a CPU BGRA buffer
++ * the D3DDrv-side decoder produces. SetMovieMaterial pumps the decoder
++ * via the UCMovieMaterialPump export, bumping a revision counter; the
++ * cache picks up the revision change and re-uploads through the standard
++ * UTexture pipeline. No Direct3DTexture8 swap, no AddRef/Release on
++ * cache pointers, no cache-hash mutation.
++ *
++ * The PC-side decoder lives in D3DDrv (D3DMoviePlayback.cpp). We reach
++ * it via GetProcAddress against D3DDrv.dll, mirroring how D3DDrv talks
++ * to ALAudio for cutscene-audio ducking.
++ *
+  * ============================================================================
+  */
+-class FMovieTexture : public FBaseTexture
++
++#ifndef _XBOX
++// PC-only: lazy GetProcAddress shim into D3DDrv's movie-material exports.
++typedef int  (*PFN_UCMovieMaterialPump)( UMovieMaterial*, int*, int*, int* );
++typedef void (*PFN_UCMovieMaterialCopy)( UMovieMaterial*, void*, int );
++typedef void (*PFN_UCMovieMaterialDispose)( UMovieMaterial* );
++
++static PFN_UCMovieMaterialPump    GMovieMatPump    = NULL;
++static PFN_UCMovieMaterialCopy    GMovieMatCopy    = NULL;
++static PFN_UCMovieMaterialDispose GMovieMatDispose = NULL;
++static UBOOL                      GMovieMatLooked  = FALSE;
++
++static void ResolveMovieMaterialAPI()
++{
++	if (GMovieMatLooked)
++		return;
++	GMovieMatLooked = TRUE;
++
++	HMODULE_LOCAL hD3DDrv = GetModuleHandleA("D3DDrv.dll");
++	if (!hD3DDrv)
++	{
++		debugf(TEXT("[MovieMat] D3DDrv.dll not loaded; movie textures inactive."));
++		return;
++	}
++	GMovieMatPump    = (PFN_UCMovieMaterialPump)   GetProcAddress(hD3DDrv, "UCMovieMaterialPump");
++	GMovieMatCopy    = (PFN_UCMovieMaterialCopy)   GetProcAddress(hD3DDrv, "UCMovieMaterialCopy");
++	GMovieMatDispose = (PFN_UCMovieMaterialDispose)GetProcAddress(hD3DDrv, "UCMovieMaterialDispose");
++
++	debugf(TEXT("[MovieMat] D3DDrv movie-material hooks: %s"),
++		(GMovieMatPump && GMovieMatCopy && GMovieMatDispose) ? TEXT("ready") : TEXT("missing"));
++}
++#endif
++
++class FMovieTexture : public FTexture
+ {
+ private:
+ 
+@@ -1106,18 +1166,63 @@ public:
+ 		pMovieMaterial = pMovie;
+ 	}
+ 
+-	// Never cache this as there is no "real" data in the UMovieMaterial
+-	// This will be manually fixed up
+-	virtual INT GetRevision() { return 0; }
++	// Read frame state from UMovieMaterial slots both DLLs can see:
++	//   USize/VSize       -- decoded frame dims (set by UCMovieMaterialPump)
++	//   LastD3DTexture    -- repurposed on PC as the revision counter,
++	//                        bumped by the pump on each successful decode.
++	// (Xbox used LastD3DTexture as a raw IDirect3DTexture8 pointer cache;
++	// the PC path doesn't keep texture pointers on the script side, so the
++	// slot is free to repurpose.)
++	virtual INT GetRevision() { return pMovieMaterial->LastD3DTexture; }
+ 
+-	virtual INT GetWidth() { return pMovieMaterial->USize; }
+-	virtual INT GetHeight()  { return pMovieMaterial->VSize; }
++	virtual INT GetWidth()
++	{
++		return pMovieMaterial->USize ? pMovieMaterial->USize : 1;
++	}
++	virtual INT GetHeight()
++	{
++		return pMovieMaterial->VSize ? pMovieMaterial->VSize : 1;
++	}
+ 	virtual INT GetFirstMip()  { return 0; }
+-	virtual INT GetNumMips() { return 1; }
++	virtual INT GetNumMips()   { return 1; }
+ 	virtual ETextureFormat GetFormat() { return TEXF_RGBA8; }
+ 
+ 	virtual ETexClampMode GetUClamp() { return TC_Clamp; }
+ 	virtual ETexClampMode GetVClamp() { return TC_Clamp; }
++
++	// FTexture interface: the engine cache locks a D3D surface for us and
++	// asks us to fill it. We delegate to D3DDrv's UCMovieMaterialCopy,
++	// which memcpys the latest BGRA frame (produced by the FFmpeg decoder)
++	// into Dest at DestStride.
++	virtual void* GetRawTextureData(INT MipIndex)            { return NULL; }
++	virtual void  UnloadRawTextureData(INT MipIndex)         {}
++	virtual UTexture* GetUTexture()                          { return NULL; }
++
++	virtual void GetTextureData(INT MipIndex, void* Dest, INT DestStride,
++		ETextureFormat DestFormat, UBOOL ColoredMips)
++	{
++		guard(FMovieTexture::GetTextureData);
++#ifndef _XBOX
++		ResolveMovieMaterialAPI();
++		if (GMovieMatCopy)
++		{
++			GMovieMatCopy(pMovieMaterial, Dest, DestStride);
++			return;
++		}
++		// D3DDrv export missing -- clear surface to opaque black so the
++		// caller doesn't render uninitialised memory.
++		INT W = GetWidth(), H = GetHeight();
++		for (INT y = 0; y < H; y++)
++		{
++			BYTE* row = (BYTE*)Dest + y * DestStride;
++			for (INT x = 0; x < W; x++)
++			{
++				row[x*4+0] = 0; row[x*4+1] = 0; row[x*4+2] = 0; row[x*4+3] = 0xFF;
++			}
++		}
++#endif
++		unguard;
++	}
+ };
+ 
+ /* scion ======================================================================
+@@ -1187,11 +1292,30 @@ void UMovieMaterial::Dispose(void)
+ 		delete ((FBaseTexture*)RenderInterface);
+ 		RenderInterface = NULL;
+ 	}
+-	// Now destroy the decoder if it exists
++	// Now destroy the decoder if it exists. On PC we route through the
++	// D3DDrv dispose export so the FFmpeg decoder is freed in the DLL
++	// that allocated it (avoids cross-DLL heap mismatch and lets D3DDrv
++	// clean any side-state tied to the material). On Xbox the decoder
++	// is a CXMVPlayer allocated in XboxDrv but visible via FMoviePlayer's
++	// virtual destructor, which the existing path handles correctly.
+ 	if (MovieDecoder != NULL)
+ 	{
++#ifndef _XBOX
++		ResolveMovieMaterialAPI();
++		if (GMovieMatDispose)
++		{
++			GMovieMatDispose(this);
++			// Dispose export is responsible for zeroing MovieDecoder.
++		}
++		else
++		{
++			delete (FMoviePlayer*)MovieDecoder;
++			MovieDecoder = NULL;
++		}
++#else
+ 		delete (FMoviePlayer*)MovieDecoder;
+ 		MovieDecoder = NULL;
++#endif
+ 	}
+ 	if (ThreadSynch != NULL)
+ 	{

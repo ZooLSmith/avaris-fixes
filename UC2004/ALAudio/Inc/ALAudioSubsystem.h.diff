@@ -1,0 +1,120 @@
+diff --git a/UC2004/ALAudio/Inc/ALAudioSubsystem.h b/UC2004/ALAudio/Inc/ALAudioSubsystem.h
+new file mode 100644
+index 00000000..97fcada5
+--- /dev/null
++++ b/UC2004/ALAudio/Inc/ALAudioSubsystem.h
+@@ -0,0 +1,114 @@
++/*=============================================================================
++	ALAudioSubsystem.h: UAudioSubsystem implementation backed by OpenAL.
++
++	v0 SCAFFOLD: pure-virtuals stubbed; Init() returns 1 so the engine
++	treats us as available. Real OpenAL device, .xap parsing, cue
++	resolution, and .wav playback all land in follow-up commits.
++=============================================================================*/
++
++#ifndef _INC_ALAUDIOSUBSYSTEM
++#define _INC_ALAUDIOSUBSYSTEM
++
++#include "altypes.h"
++#include "alctypes.h"
++#include "ALCueTable.h"
++typedef struct ALCdevice_struct ALCdevice;
++typedef struct ALCcontext_struct ALCcontext;
++
++// PC port: cutscene-playback hooks for the D3DDrv movie player.
++extern "C" __declspec(dllexport) void  UCMovieAudioDuck( int bDucked );
++extern "C" __declspec(dllexport) float UCMovieGetCategoryVolume( int category );
++
++class ALAUDIO_API UALAudioSubsystem : public UAudioSubsystem
++{
++	DECLARE_CLASS(UALAudioSubsystem,UAudioSubsystem,CLASS_Config,ALAudio)
++public:
++	UViewport*			Viewport;
++	FLOAT				CategoryVolumes[UAudioSubsystem::VOLUME_Max];
++	TMap<FString,FCueDef>	Cues;
++
++	// Source pool: fixed-size allocation of OpenAL sources reused across
++	// PlaySoundCue calls. Each slot tracks which actor + cue is bound, so
++	// StopSoundCue(actor, name) and StopSoundCues(actor) can find matches.
++	struct FALSource
++	{
++		ALuint  Source;
++		FName   CueName;
++		AActor* Actor;
++		UBOOL   InUse;
++		UBOOL   bAmbient;
++		// Cached envelope params + start time for per-frame pitch update.
++		UBOOL   bHasPitchEG;
++		INT     EG_Delay;
++		INT     EG_Attack;
++		INT     EG_Hold;
++		INT     EG_Decay;
++		INT     EG_Sustain;
++		INT     PitchScaleCents;
++		DOUBLE  StartTime;
++	};
++	TArray<FALSource> SourcePool;
++
++	// Buffer cache: cue FName -> alBuffer holding decoded PCM. Populated
++	// lazily on first PlaySoundCue per cue; never freed during a session
++	// (the wav data is small relative to the textures the engine already
++	// caches, and re-decoding on every play is wasteful).
++	TMap<FString,ALuint> BufferCache;
++
++	// Music: a dedicated AL source separate from the SFX pool so it
++	// never gets evicted by gameplay sounds. One song at a time; the
++	// engine hands us a handle that StopMusic / StopAllMusic match.
++	ALuint MusicSource;
++	ALuint MusicBuffer;
++	INT    NextMusicHandle;
++	INT    CurrentMusicHandle;
++	FString CurrentMusicSong;
++
++	// Internal helpers.
++	ALuint  GetOrLoadBuffer( const FString& CueKey, const FCueDef& Def );
++	INT     FindFreeSourceSlot();
++
++	// OpenAL: dynamically loaded; we only ship the SDK headers, so resolve
++	// every function pointer via GetProcAddress at Init() time. Matches
++	// UnrealWarfare's FindProc pattern.
++	void*       DLLHandle;
++	ALCdevice*  SoundDevice;
++	ALCcontext* SoundContext;
++	UBOOL       BindOpenAL();
++	void        UnbindOpenAL();
++
++	UALAudioSubsystem();
++	void StaticConstructor();
++
++	// UObject interface.
++	void Destroy();
++
++	// UAudioSubsystem interface (UC2 surface — see Engine/Inc/UnAudio.h).
++	UBOOL  Init();
++	void   SetViewport( UViewport* InViewport );
++	UBOOL  Exec( const TCHAR* Cmd, FOutputDevice& Ar=*GLog );
++	void   Update();
++
++	void   PlaySoundCue( AActor* SrcActor, FName SoundCue, UBOOL bAmbient = 0, FLOAT Volume = 0.f );
++	void   StopSoundCue( AActor* SrcActor, FName SoundCue );
++	void   StopSoundCues( AActor* SrcActor );
++	FLOAT  GetSoundCueDuration( FName SoundCue );
++	FLOAT  GetSoundCueRadius( FName SoundCue );
++
++	FLOAT  GetCategoryVolume( EVolumeCategory Category );
++	void   SetCategoryVolume( EVolumeCategory Category, FLOAT NewVolume );
++
++	INT    PlayMusic( FString Song, FLOAT FadeInTime );
++	UBOOL  StopMusic( INT SongHandle, FLOAT FadeOutTime );
++	INT    StopAllMusic( FLOAT FadeOutTime );
++
++	void       NoteDestroy( AActor* Actor );
++	UViewport* GetViewport();
++	void       CleanUp();
++
++	void NotifyLevelChange();
++	void NotifyZoneChange( AZoneInfo* NewZone );
++	void NotifyPauseChange( UBOOL bNowPaused );
++};
++
++#endif

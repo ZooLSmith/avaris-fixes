@@ -1,0 +1,370 @@
+diff --git a/UC2004/UCMenu/Classes/UC2Settings_Video.uc b/UC2004/UCMenu/Classes/UC2Settings_Video.uc
+new file mode 100644
+index 00000000..4e311e77
+--- /dev/null
++++ b/UC2004/UCMenu/Classes/UC2Settings_Video.uc
+@@ -0,0 +1,364 @@
++/*==============================================================================
++  PC Video settings page: brightness/gamma/contrast sliders, fullscreen
++  toggle, and a resolution dropdown populated from whatever modes the
++  D3D adapter actually reports (LISTRESOLUTIONS console command added in
++  D3DDrv/Src/D3DRenderDevice.cpp).
++
++  Modeled on UC2Settings_Audio.uc. Sliders live-preview via the engine's
++  BRIGHTNESS / GAMMA / CONTRAST console handlers (UnCamMgr.cpp), which
++  also SaveConfig() so persistence is automatic. Fullscreen toggles live
++  via TOGGLEFULLSCREEN. Resolution applies only on save (via SETRES) so
++  the user doesn't get a disruptive resize on every dropdown twiddle.
++==============================================================================*/
++
++class UC2Settings_Video extends UC2Settings_PageBase;
++`include(GUI.huc)
++
++var() moCheckbox    chk_Fullscreen;
++var() moTextOption  txt_Resolution;
++var() moSlider      sl_Brightness, sl_Gamma, sl_Contrast;
++
++var() transient float  OriginalBrightness, OriginalGamma, OriginalContrast;
++var() transient bool   bOriginalFullscreen;
++var() transient string OriginalResolution;
++
++final function float GetBrightness()
++{
++	return float(PlayerOwner().ConsoleCommand("GETBRIGHTNESS"));
++}
++
++final function float GetGamma()
++{
++	return float(PlayerOwner().ConsoleCommand("GETGAMMA"));
++}
++
++final function float GetContrast()
++{
++	return float(PlayerOwner().ConsoleCommand("GETCONTRAST"));
++}
++
++final function bool IsFullscreenNow()
++{
++	return bool(PlayerOwner().ConsoleCommand("ISFULLSCREEN"));
++}
++
++final function string GetCurrentRes()
++{
++	return PlayerOwner().ConsoleCommand("GETCURRENTRES");
++}
++
++event InitComponent( GUIController InController, GUIComponent InOwner )
++{
++	local string Modes;
++	local array<string> Lines;
++	local int i;
++
++	Super.InitComponent(InController, InOwner);
++
++	// Populate the resolution dropdown from whatever the D3D adapter
++	// actually supports. LISTRESOLUTIONS emits "WxH|WxH|" (pipe-
++	// delimited because FStringOutputDevice doesn't add line
++	// terminators between Logf calls -- newlines would just concatenate
++	// the values together).
++	Modes = PlayerOwner().ConsoleCommand("LISTRESOLUTIONS");
++	class'Object'.static.Split(Modes, Lines, "|", true);
++	for ( i = 0; i < Lines.Length; i++ )
++	{
++		if ( Lines[i] != "" )
++			txt_Resolution.AddItem(Lines[i], Lines[i]);
++	}
++}
++
++final function ValueChange( GUIComponent Sender )
++{
++	if ( Sender == chk_Fullscreen )
++	{
++		// Live toggle so the user can preview the mode before committing.
++		if ( IsFullscreenNow() != chk_Fullscreen.IsChecked() )
++			PlayerOwner().ConsoleCommand("TOGGLEFULLSCREEN");
++	}
++
++	InternalOnChange(Sender);
++	bDirty = true;
++}
++
++final function SliderChanged( GUIComponent Sender )
++{
++	switch ( Sender )
++	{
++	case sl_Brightness:
++		PlayerOwner().ConsoleCommand("BRIGHTNESS" @ sl_Brightness.GetValue());
++		break;
++
++	case sl_Gamma:
++		PlayerOwner().ConsoleCommand("GAMMA" @ sl_Gamma.GetValue());
++		break;
++
++	case sl_Contrast:
++		PlayerOwner().ConsoleCommand("CONTRAST" @ sl_Contrast.GetValue());
++		break;
++	}
++
++	InternalOnChange(Sender);
++	bDirty = true;
++}
++
++function InternalOnChange( GUIComponent Sender )
++{
++	local GUIComponent Comp;
++	local string NewCaption;
++
++	if ( Sender == pnl_Options )
++		Comp = pnl_Options.GetFocusedControl();
++	else
++		Comp = Sender;
++
++	if ( moSlider(Comp) != None )
++	{
++		ftr_ControlPanel.pnl_Button.SetButtonCaption(XC_A, `localize(sAdjust, true));
++	}
++	else if ( moCheckbox(Comp) != None )
++	{
++		NewCaption = moCheckbox(Comp).IsChecked() ? `localize(sDisable, true) : `localize(sEnable, true);
++		ftr_ControlPanel.pnl_Button.SetButtonCaption(XC_A, NewCaption);
++	}
++	else if ( moTextOption(Comp) != None )
++	{
++		ftr_ControlPanel.pnl_Button.SetButtonCaption(XC_A, `localize(sAdjust, true));
++	}
++
++	UpdateActionButton(Comp);
++}
++
++// =====================================================================================================================
++//  UC2OptionPage Interface
++// =====================================================================================================================
++
++function InitOptions()
++{
++	pnl_Options.AddItem(chk_Fullscreen);
++	pnl_Options.AddItem(txt_Resolution);
++	pnl_Options.AddItem(sl_Brightness);
++	pnl_Options.AddItem(sl_Gamma);
++	pnl_Options.AddItem(sl_Contrast);
++
++	OriginalBrightness  = GetBrightness();
++	OriginalGamma       = GetGamma();
++	OriginalContrast    = GetContrast();
++	bOriginalFullscreen = IsFullscreenNow();
++	OriginalResolution  = GetCurrentRes();
++
++	Super.InitOptions();
++}
++
++// =====================================================================================================================
++//  UC2PageBase Implementation
++// =====================================================================================================================
++
++function LoadSettings()
++{
++	local bool bTemp;
++	local int i;
++	local string CurRes;
++
++	bTemp = Controller.bCurMenuInitialized;
++	Controller.bCurMenuInitialized = false;
++
++	sl_Brightness.SetValue(GetBrightness());
++	sl_Gamma.SetValue(GetGamma());
++	sl_Contrast.SetValue(GetContrast());
++	chk_Fullscreen.SetValue(IsFullscreenNow(), true);
++
++	CurRes = GetCurrentRes();
++	for ( i = 0; i < txt_Resolution.ItemCount(); i++ )
++	{
++		if ( txt_Resolution.GetItemAt(i, true) == CurRes )
++		{
++			txt_Resolution.SetIndex(i, true);
++			break;
++		}
++	}
++
++	if ( pnl_Options.Items.Length > 0 )
++		InternalOnChange(pnl_Options.Items[0].Item);
++
++	Controller.bCurMenuInitialized = bTemp;
++	Super.LoadSettings();
++}
++
++function SaveSettings( optional bool bNoWrite )
++{
++	local string DesiredRes, ModeFlag, Supported;
++	local int xPos;
++	local string WStr, HStr;
++
++	// Brightness/Gamma/Contrast already persist via the engine's own
++	// SaveConfig() in their console handlers; nothing to do here for
++	// those. Fullscreen was applied live in ValueChange.
++	//
++	// Resolution applies only on save: SETRES tears down + re-creates
++	// the device, which is too disruptive to fire from a dropdown
++	// twiddle. We compare against OriginalResolution (captured at page
++	// open) instead of GetCurrentRes(), because TOGGLEFULLSCREEN shifts
++	// the viewport to a smaller default windowed size and that would
++	// falsely trip the diff check.
++	DesiredRes = txt_Resolution.GetItem(true);
++	if ( DesiredRes != "" && DesiredRes != OriginalResolution )
++	{
++		// Validate the WxH+mode combo before SETRES. CreateDevice
++		// failure inside SetRes calls appErrorf and terminates the
++		// process; far better to log+skip if the adapter doesn't
++		// support this specific combo.
++		xPos = InStr(DesiredRes, "x");
++		if ( xPos > 0 )
++		{
++			WStr = Left(DesiredRes, xPos);
++			HStr = Mid(DesiredRes, xPos + 1);
++			Supported = PlayerOwner().ConsoleCommand("SUPPORTEDRESOLUTION WIDTH=" $ WStr @ "HEIGHT=" $ HStr @ "BITDEPTH=32");
++			if ( Supported == "1" )
++			{
++				ModeFlag = chk_Fullscreen.IsChecked() ? "f" : "w";
++				PlayerOwner().ConsoleCommand("SETRES" @ DesiredRes $ "x32" $ ModeFlag);
++			}
++			else
++			{
++				Log("UC2Settings_Video: skipping SETRES, adapter does not support" @ DesiredRes @ "at 32bpp");
++			}
++		}
++	}
++
++	Super.SaveSettings(bNoWrite);
++}
++
++function CancelChanges()
++{
++	PlayerOwner().ConsoleCommand("BRIGHTNESS" @ OriginalBrightness);
++	PlayerOwner().ConsoleCommand("GAMMA" @ OriginalGamma);
++	PlayerOwner().ConsoleCommand("CONTRAST" @ OriginalContrast);
++
++	if ( IsFullscreenNow() != bOriginalFullscreen )
++		PlayerOwner().ConsoleCommand("TOGGLEFULLSCREEN");
++
++	Super.CancelChanges();
++}
++
++function InitButtonIcons()
++{
++	ftr_ControlPanel.AddStandardButton(XC_A, `localize(sAdjust, true));
++	ftr_ControlPanel.AddButton(XC_White, `localize(sDefaults, true), 0.353125, 0);
++	ftr_ControlPanel.AddButton(XC_Black, `localize(sCancel, true), 0.593750, 0);
++	Super.InitButtonIcons();
++}
++
++DefaultProperties
++{
++	IgnoredRepeatKey=200 // XC_A -- match Audio page
++
++	SubTitle="VIDEO"
++
++	Begin Object Class=ItemSelectionPanel Name=MainOptionPanel
++		WinWidth=0.567188
++		WinHeight=0.501249
++		WinLeft=0.071875
++		WinTop=0.207709
++		ItemSpacing=11
++		OnChange=InternalOnChange
++	End Object
++	pnl_Options=MainOptionPanel
++
++	Begin Object Class=moCheckbox Name=FullscreenCheckbox
++		WinWidth=313
++		WinHeight=0.045833
++		WinLeft=0.051724
++		WinTop=104
++		TabOrder=0
++		Caption="FULLSCREEN"
++		LabelStyleName="Sui24pt_C8C8C8FF"
++		Hint="TOGGLE BETWEEN FULLSCREEN AND WINDOWED MODE"
++		OnChange=ValueChange
++		bPropagateState=false
++		CaptionWidth=0.9
++		ComponentJustification=TXTA_Center
++	End Object
++	chk_Fullscreen=FullscreenCheckbox
++
++	Begin Object Class=moTextOption Name=ResolutionOption
++		WinWidth=0.476563
++		WinHeight=0.045833
++		WinLeft=0.060519
++		WinTop=140
++		TabOrder=1
++		Caption="RESOLUTION"
++		LabelStyleName="Sui24pt_C8C8C8FF"
++		Hint="SELECT DISPLAY RESOLUTION (APPLIED ON CLOSE)"
++		OnChange=ValueChange
++		bPropagateState=false
++		CaptionWidth=0.4
++	End Object
++	txt_Resolution=ResolutionOption
++
++	Begin Object Class=moSlider Name=BrightnessSlider
++		WinWidth=313
++		WinHeight=0.083750
++		WinLeft=0.076563
++		WinTop=200
++		Caption=" BRIGHTNESS"
++		Hint="SET DISPLAY BRIGHTNESS"
++		LabelStyleName="Sui24pt_C8C8C8FF"
++		bVerticalLayout=True
++		ComponentWidth=0.3
++		OnChange=SliderChanged
++		VertLabelJustification=TXTA_Center
++		ComponentJustification=TXTA_Right
++		bPropagateState=false
++		TabOrder=2
++		MinValue=0.0
++		MaxValue=1.0
++	End Object
++	sl_Brightness=BrightnessSlider
++
++	Begin Object Class=moSlider Name=GammaSlider
++		WinWidth=313
++		WinHeight=0.083750
++		WinLeft=0.076563
++		WinTop=251
++		Caption=" GAMMA"
++		Hint="ADJUST DISPLAY GAMMA"
++		LabelStyleName="Sui24pt_C8C8C8FF"
++		bVerticalLayout=True
++		ComponentWidth=0.3
++		OnChange=SliderChanged
++		VertLabelJustification=TXTA_Center
++		ComponentJustification=TXTA_Right
++		bPropagateState=false
++		TabOrder=3
++		MinValue=0.5
++		MaxValue=2.5
++		// GUISlider clamps via minSettingValue (not MinValue, which is
++		// just for fill-bar percentage). Without this, the thumb could
++		// be dragged below 0.5 -- the engine clamped the GAMMA console
++		// value internally, so the visible slider position lied.
++		minSettingValue=0.5
++	End Object
++	sl_Gamma=GammaSlider
++
++	Begin Object Class=moSlider Name=ContrastSlider
++		WinWidth=313
++		WinHeight=0.083750
++		WinLeft=0.076563
++		WinTop=302
++		Caption=" CONTRAST"
++		Hint="SET DISPLAY CONTRAST"
++		LabelStyleName="Sui24pt_C8C8C8FF"
++		bVerticalLayout=True
++		ComponentWidth=0.3
++		OnChange=SliderChanged
++		VertLabelJustification=TXTA_Center
++		ComponentJustification=TXTA_Right
++		bPropagateState=false
++		TabOrder=4
++		MinValue=0.0
++		MaxValue=2.0
++	End Object
++	sl_Contrast=ContrastSlider
++}

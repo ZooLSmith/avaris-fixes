@@ -1,0 +1,127 @@
+diff --git a/UC2004/D3DDrv/Src/D3DMaterialState.cpp b/UC2004/D3DDrv/Src/D3DMaterialState.cpp
+index 64a3b142..753a17a0 100644
+--- a/UC2004/D3DDrv/Src/D3DMaterialState.cpp
++++ b/UC2004/D3DDrv/Src/D3DMaterialState.cpp
+@@ -4759,24 +4759,112 @@ UBOOL FD3DRenderInterface::SetMovieMaterial(UMovieMaterial* pMovieMaterial,
+ 
+ #else
+ 
++// Defined in D3DMoviePlayback.cpp; same DLL, called directly.
++extern "C" int UCMovieMaterialPump( UMovieMaterial*, int*, int*, int* );
++
+ /* scion ======================================================================
+  * FD3DRenderInterface::SetMovieMaterial
+- * Author: jg
+- * 
+- * Always returns not found on the PC
++ * Author: jg (PC port -- buffer-output FFmpeg path)
++ * ============================================================================
+  *
+- * input:	ignored
+- *			ignored
+- *			ignored
+- *			ignored
++ * Pumps the per-material FFmpeg decoder (UCMovieMaterialPump in
++ * D3DMoviePlayback) so it advances at most one frame per wallclock-paced
++ * tick, then dispatches as a regular bitmap via SetSimpleMaterial. The
++ * engine's standard cache pipeline picks up the bumped revision counter
++ * and re-uploads via FMovieTexture::GetTextureData -> UCMovieMaterialCopy.
++ *
++ * No Direct3DTexture8 swap, no AddRef/Release on cache pointers, no
++ * cache-hash mutation -- the engine cache owns the D3D texture lifecycle
++ * identically to every other UTexture. (This shape is deliberate: the
++ * earlier Xbox-style cache-pointer-swap PC port crashed in
++ * DrawIndexedPrimitive once weapon meshes loaded; see commit ea224cef
++ * and planning/video-port.md "Material-movie attempt: failure mode".)
+  *
+  * ============================================================================
+  */
+-UBOOL FD3DRenderInterface::SetMovieMaterial(UMovieMaterial*,FD3DModifierInfo,
+-	FString*,UMaterial**)
++UBOOL FD3DRenderInterface::SetMovieMaterial(UMovieMaterial* pMovieMaterial,
++	FD3DModifierInfo BaseModifierInfo, FString* ErrorString,
++	UMaterial** ErrorMaterial)
+ {
+ 	guard(FD3DRenderInterface::SetMovieMaterial);
+-	return 0;
++
++	if( !pMovieMaterial || pMovieMaterial->bHasError )
++		return 0;
++
++	int rev = 0, w = 0, h = 0;
++	if( !UCMovieMaterialPump( pMovieMaterial, &rev, &w, &h ) )
++	{
++		// Open failed (FFmpeg DLLs missing, file not found, codec init
++		// rejected). Fall back to LoadingFallback if the artist supplied
++		// one, otherwise DefaultMaterial. Same shape as the Xbox path's
++		// background-load-pending branch.
++		return SetMaterial(
++			pMovieMaterial->LoadingFallback ? pMovieMaterial->LoadingFallback
++			                                : pMovieMaterial->DefaultMaterial,
++			ErrorString, ErrorMaterial, NULL );
++	}
++
++	// Stage 0: bind the FMovieTexture via the cache. UMovieMaterial extends
++	// UBitmapMaterial; its Get() returns this; its GetRenderInterface()
++	// returns the FMovieTexture. SetShaderBitmap calls CacheTexture, which
++	// compares the stored revision against FMovieTexture::GetRevision()
++	// (= pMat->LastD3DTexture, just bumped by the pump) and on mismatch
++	// locks the cache-allocated D3D surface and calls FMovieTexture::
++	// GetTextureData -> UCMovieMaterialCopy to fill it.
++	//
++	// Crucially, we DO NOT mutate Stage.Texture->Direct3DTexture8 -- the
++	// cache owns that pointer end to end. The reverted attempt's swap was
++	// what corrupted vertex/index buffer pointers via a freed-pointer
++	// alias and crashed DrawIndexedPrimitive (commit 0bffd7ad).
++	SetShaderBitmap( CurrentState->MaterialPasses[0]->Stages[0], pMovieMaterial );
++	ApplyTexModifier( CurrentState->MaterialPasses[0]->Stages[0], &BaseModifierInfo );
++
++	CurrentState->MaterialPasses[0]->Stages[0].ColorArg1 = D3DTA_TEXTURE;
++	CurrentState->MaterialPasses[0]->Stages[0].AlphaArg1 = D3DTA_TEXTURE;
++	CurrentState->MaterialPasses[0]->Stages[0].ColorOp   = D3DTOP_SELECTARG1;
++	CurrentState->MaterialPasses[0]->Stages[0].AlphaOp   = D3DTOP_SELECTARG1;
++	CurrentState->MaterialPasses[0]->StagesUsed = 1;
++
++	// Movie materials always alpha-blend onto the framebuffer. WMV2 has
++	// no source alpha so sws_scale fills A=0xFF; the shape comes from the
++	// optional Mask material configured below. SetSimpleMaterial would
++	// pick blend defaults from UTexture::bMasked/bAlphaTexture, but
++	// UMovieMaterial isn't a UTexture so those checks miss.
++	if( pMovieMaterial->bAdditive == 0 )
++	{
++		CurrentState->MaterialPasses[0]->SrcBlend  = D3DBLEND_SRCALPHA;
++		CurrentState->MaterialPasses[0]->DestBlend = D3DBLEND_INVSRCALPHA;
++	}
++	else
++	{
++		CurrentState->MaterialPasses[0]->SrcBlend  = D3DBLEND_ONE;
++		CurrentState->MaterialPasses[0]->DestBlend = D3DBLEND_INVSRCCOLOR;
++	}
++	CurrentState->MaterialPasses[0]->AlphaBlending = 1;
++	CurrentState->MaterialPasses[0]->AlphaRef      = 0;
++	CurrentState->MaterialPasses[0]->ZWrite        = 1;
++	CurrentState->MaterialPasses[0]->ZTest         = 1;
++	CurrentState->MaterialPasses[0]->TwoSided      = 0;
++
++	// Stage 1: optional Mask material (used for rounded portrait corners
++	// and similar artist-supplied alpha shapes). Color stays from stage 0
++	// (the movie color); alpha gets replaced by the mask's alpha.
++	if( pMovieMaterial->Mask != NULL )
++	{
++		CurrentState->MaterialPasses[0]->Stages[1].ColorArg1 = D3DTA_CURRENT;
++		CurrentState->MaterialPasses[0]->Stages[1].AlphaArg1 = D3DTA_TEXTURE;
++		CurrentState->MaterialPasses[0]->Stages[1].ColorOp   = D3DTOP_SELECTARG1;
++		CurrentState->MaterialPasses[0]->Stages[1].AlphaOp   = D3DTOP_SELECTARG1;
++		FD3DModifierInfo MaskModifier;
++		UBitmapMaterial* Mask = CheckMaterial<UBitmapMaterial,
++			MRH_BitmapMaterial>( this, pMovieMaterial->Mask, &MaskModifier );
++		SetShaderBitmap( CurrentState->MaterialPasses[0]->Stages[1], Mask );
++		ApplyTexModifier( CurrentState->MaterialPasses[0]->Stages[1], &MaskModifier );
++		CurrentState->MaterialPasses[0]->StagesUsed = 2;
++	}
++
++	CurrentState->NumMaterialPasses = 1;
++	return 1;
+ 	unguard;
+ }
+ 

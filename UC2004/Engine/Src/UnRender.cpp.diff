@@ -1,0 +1,226 @@
+diff --git a/UC2004/Engine/Src/UnRender.cpp b/UC2004/Engine/Src/UnRender.cpp
+index c886fbe0..65e2ae4b 100644
+--- a/UC2004/Engine/Src/UnRender.cpp
++++ b/UC2004/Engine/Src/UnRender.cpp
+@@ -2119,9 +2119,32 @@ void FPlayerSceneNode::Render(FRenderInterface* RI)
+ 
+ 		CLOCK(IntPreRen,GStats.DWORDStats(GEngineStats.STATS_Game_InteractionPreRender));
+ 
++		// PC port: GUI page PreDraw / OnPreDraw delegates run inside
++		// MasterProcessPreRender and read Canvas->SizeX directly to
++		// compute centred popup positions (e.g. GUIMessageBox computes
++		// WinLeft = (C.SizeX - WinWidth)/2). Without overriding the
++		// canvas dims here, those positions get baked against the real
++		// backbuffer size (1280x720) and then end up off-centre when the
++		// pillarbox projection re-maps them at PostRender time. Keep the
++		// override scoped to the PreRender pass only -- the 3D scene
++		// render right after this needs the real backbuffer dims.
++		const INT   _PreSavedSizeX = Viewport->Canvas->SizeX;
++		const INT   _PreSavedSizeY = Viewport->Canvas->SizeY;
++		const FLOAT _PreSavedClipX = Viewport->Canvas->ClipX;
++		const FLOAT _PreSavedClipY = Viewport->Canvas->ClipY;
++		Viewport->Canvas->SizeX = 640;
++		Viewport->Canvas->SizeY = 480;
++		Viewport->Canvas->ClipX = 640.f;
++		Viewport->Canvas->ClipY = 480.f;
++
+ 		if ( Viewport->InteractionMaster )
+ 			Viewport->InteractionMaster->MasterProcessPreRender(Viewport);
+ 
++		Viewport->Canvas->SizeX = _PreSavedSizeX;
++		Viewport->Canvas->SizeY = _PreSavedSizeY;
++		Viewport->Canvas->ClipX = _PreSavedClipX;
++		Viewport->Canvas->ClipY = _PreSavedClipY;
++
+ 		UNCLOCK();
+ 
+ 		// Fiddle with the projection matrix to produce a letterbox viewport.
+@@ -2181,8 +2204,63 @@ void FPlayerSceneNode::Render(FRenderInterface* RI)
+ 		{
+ 			GUglyHackFlags |= 1;
+ 			FUNC_CLOCK(HudCyc,GStats.DWORDStats(GEngineStats.STATS_Game_HUDPostRender));
++			// PC port: HUD::PostRender3DItems calls Weapon.RenderOverlays
++			// (HUD.uc:240-253), which both (a) issues 2D crosshair draws
++			// through Canvas and (b) positions the 1st-person viewmodel
++			// (a 3D mesh rendered via the camera pipeline). The crosshair
++			// must pillarbox; the viewmodel must NOT (it'd squash). We
++			// override Canvas dims + projection matrix so the 2D crosshair
++			// projects into a centred 4:3 sub-range of NDC, but leave the
++			// D3D viewport at full size so 3D camera-projected geometry
++			// (the viewmodel) keeps using the whole backbuffer. The
++			// projection's X scale is reduced from 2/640 to 2*PbScale/640
++			// where PbScale = PbW/SizeX -- design X=320 still maps to
++			// NDC X=0, but design X=0/640 map to NDC -PbScale/+PbScale
++			// instead of -1/+1, putting the crosshair inside the pillarbox.
+ 			if ( Viewport->Actor->myHUD )
++			{
++				const INT   _3DSizeX = Viewport->Canvas->SizeX;
++				const INT   _3DSizeY = Viewport->Canvas->SizeY;
++				const FLOAT _3DClipX = Viewport->Canvas->ClipX;
++				const FLOAT _3DClipY = Viewport->Canvas->ClipY;
++				const FLOAT _3DScale = (FLOAT)_3DSizeY / 480.f;
++				const INT   _3DPbW = (INT)(640.f * _3DScale);
++				const FLOAT _3DPbScaleX = (FLOAT)_3DPbW / (FLOAT)_3DSizeX;
++
++				Viewport->Canvas->SizeX = 640;
++				Viewport->Canvas->SizeY = 480;
++				Viewport->Canvas->ClipX = 640.f;
++				Viewport->Canvas->ClipY = 480.f;
++
++				FMatrix _3DSavedC2S, _3DSavedS2C;
++				UBOOL _3DRebuilt = false;
++				if( Viewport->Canvas->pCanvasUtil )
++				{
++					Viewport->Canvas->pCanvasUtil->Flush();
++					_3DSavedC2S = Viewport->Canvas->pCanvasUtil->CanvasToScreen;
++					_3DSavedS2C = Viewport->Canvas->pCanvasUtil->ScreenToCanvas;
++					Viewport->Canvas->pCanvasUtil->CanvasToScreen =
++						FTranslationMatrix(FVector(-640.f * 0.5f - 0.5f, -480.f * 0.5f - 0.5f, 0.f)) *
++						FScaleMatrix(FVector(2.f * _3DPbScaleX / 640.f, -2.f / 480.f, 1.f));
++					Viewport->Canvas->pCanvasUtil->ScreenToCanvas =
++						Viewport->Canvas->pCanvasUtil->CanvasToScreen.Inverse();
++					_3DRebuilt = true;
++				}
++
+ 				Viewport->Actor->myHUD->eventPostRender3DItems(Viewport->Canvas);
++
++				if( Viewport->Canvas->pCanvasUtil )
++					Viewport->Canvas->pCanvasUtil->Flush();
++				Viewport->Canvas->SizeX = _3DSizeX;
++				Viewport->Canvas->SizeY = _3DSizeY;
++				Viewport->Canvas->ClipX = _3DClipX;
++				Viewport->Canvas->ClipY = _3DClipY;
++				if( _3DRebuilt && Viewport->Canvas->pCanvasUtil )
++				{
++					Viewport->Canvas->pCanvasUtil->CanvasToScreen = _3DSavedC2S;
++					Viewport->Canvas->pCanvasUtil->ScreenToCanvas = _3DSavedS2C;
++				}
++			}
+ 			GUglyHackFlags &= ~1;
+ 		}
+ 
+@@ -2224,6 +2302,94 @@ void FPlayerSceneNode::Render(FRenderInterface* RI)
+ 		// Dyanmic Gamma Adjustment
+ 		RI->UpdateDynamicGamma();
+ 
++		// PC port: HUD + GUI Interactions render into a 4:3 pillarboxed
++		// design area. UC2 layout was authored against 640x480 (Xbox
++		// native) and mixes pixel-absolute and fraction-of-canvas
++		// conventions; rendering into a fixed 640x480 logical surface
++		// stretched to the pillarbox region resolves both conventions
++		// uniformly without re-authoring assets. Implementation: temporarily
++		// override Canvas->SizeX/Y, ClipX/Y, and Controller->ResX/ResY to
++		// 640x480 (so script-side reads see design dimensions), then set
++		// the D3D viewport to the centered 4:3 pixel rect on the actual
++		// backbuffer. All UCanvas / UGUIComponent draws naturally land in
++		// the pillarbox area; pillarbox bars on the left/right show the
++		// 3D world rendered before this block.
++		const INT   _SavedSizeX = Viewport->Canvas->SizeX;
++		const INT   _SavedSizeY = Viewport->Canvas->SizeY;
++		const FLOAT _SavedClipX = Viewport->Canvas->ClipX;
++		const FLOAT _SavedClipY = Viewport->Canvas->ClipY;
++
++		// GUI controller's ResX/ResY drive UGUIComponent::ActualLeft/Top
++		// fractional math; need to override those too. Engine module
++		// can't include GUI/GUIController.h directly, so we reach the
++		// fields by UProperty offset reflection on whichever interaction
++		// is named "GUIController".
++		UObject* _GUI = NULL;
++		UProperty* _ResXProp = NULL;
++		UProperty* _ResYProp = NULL;
++		INT _SavedCtrlResX = 0, _SavedCtrlResY = 0;
++		if( Viewport->InteractionMaster )
++		{
++			for( INT i = 0; i < Viewport->InteractionMaster->GlobalInteractions.Num(); i++ )
++			{
++				UInteraction* It = Viewport->InteractionMaster->GlobalInteractions(i);
++				if( It && appStrcmp(It->GetClass()->GetName(), TEXT("GUIController")) == 0 )
++				{
++					_GUI = It;
++					_ResXProp = FindField<UProperty>( It->GetClass(), TEXT("ResX") );
++					_ResYProp = FindField<UProperty>( It->GetClass(), TEXT("ResY") );
++					break;
++				}
++			}
++		}
++		const FLOAT _HudScale = (FLOAT)_SavedSizeY / 480.f;
++		const INT   _PbW = (INT)(640.f * _HudScale);
++		const INT   _PbH = (INT)(480.f * _HudScale);
++		const INT   _PbX = Max( 0, (_SavedSizeX - _PbW) / 2 );
++		const INT   _PbY = 0;
++
++		Viewport->Canvas->SizeX = 640;
++		Viewport->Canvas->SizeY = 480;
++		Viewport->Canvas->ClipX = 640.f;
++		Viewport->Canvas->ClipY = 480.f;
++		if( _GUI && _ResXProp && _ResYProp )
++		{
++			INT* RX = (INT*)((BYTE*)_GUI + _ResXProp->Offset);
++			INT* RY = (INT*)((BYTE*)_GUI + _ResYProp->Offset);
++			_SavedCtrlResX = *RX;
++			_SavedCtrlResY = *RY;
++			*RX = 640;
++			*RY = 480;
++		}
++
++		// pCanvasUtil's CanvasToScreen projection was built at frame start
++		// against the real backbuffer size (e.g. 1280); script draws in
++		// design-coord space (e.g. x=320) would project to NDC using that
++		// 1280-wide matrix and end up squeezed into the left of the
++		// pillarbox viewport. Flush any in-flight draws against the
++		// original projection, then rebuild the matrix for 640x480 so
++		// design-space coords project to NDC of the logical surface that
++		// the viewport stretches across the pillarbox region.
++		FMatrix _SavedC2S, _SavedS2C;
++		UBOOL _RebuiltMat = false;
++		if( Viewport->Canvas->pCanvasUtil )
++		{
++			Viewport->Canvas->pCanvasUtil->Flush();
++			_SavedC2S = Viewport->Canvas->pCanvasUtil->CanvasToScreen;
++			_SavedS2C = Viewport->Canvas->pCanvasUtil->ScreenToCanvas;
++			Viewport->Canvas->pCanvasUtil->CanvasToScreen =
++				FTranslationMatrix(FVector(-640.f * 0.5f - 0.5f, -480.f * 0.5f - 0.5f, 0.f)) *
++				FScaleMatrix(FVector(2.f / 640.f, -2.f / 480.f, 1.f));
++			Viewport->Canvas->pCanvasUtil->ScreenToCanvas =
++				Viewport->Canvas->pCanvasUtil->CanvasToScreen.Inverse();
++			_RebuiltMat = true;
++		}
++
++		// SetViewport/ResetViewport are a matched push/pop pair on the
++		// renderer's viewport stack -- not PushState/PopState (those are
++		// for the wider render-state stack).
++		RI->SetViewport( _PbX, _PbY, _PbW, _PbH );
++
+ 		// Render the HUD and first person weapon.
+ 
+ #ifndef FINAL_RELEASE
+@@ -2251,6 +2417,29 @@ void FPlayerSceneNode::Render(FRenderInterface* RI)
+ 
+ 		UNCLOCK();
+ 
++		// Restore canvas dimensions, controller resolution, projection
++		// matrix, and viewport. Flush HUD/GUI draws against the 640x480
++		// projection while the pillarbox viewport is still active.
++		if( Viewport->Canvas->pCanvasUtil )
++			Viewport->Canvas->pCanvasUtil->Flush();
++		RI->ResetViewport();
++		Viewport->Canvas->SizeX = _SavedSizeX;
++		Viewport->Canvas->SizeY = _SavedSizeY;
++		Viewport->Canvas->ClipX = _SavedClipX;
++		Viewport->Canvas->ClipY = _SavedClipY;
++		if( _RebuiltMat && Viewport->Canvas->pCanvasUtil )
++		{
++			Viewport->Canvas->pCanvasUtil->CanvasToScreen = _SavedC2S;
++			Viewport->Canvas->pCanvasUtil->ScreenToCanvas = _SavedS2C;
++		}
++		if( _GUI && _ResXProp && _ResYProp )
++		{
++			INT* RX = (INT*)((BYTE*)_GUI + _ResXProp->Offset);
++			INT* RY = (INT*)((BYTE*)_GUI + _ResYProp->Offset);
++			*RX = _SavedCtrlResX;
++			*RY = _SavedCtrlResY;
++		}
++
+ #ifndef FINAL_RELEASE
+ 		// Render performance stats.
+ 		CLOCK(StatsCyc,GStats.DWORDStats(GEngineStats.STATS_Stats_RenderCycles));

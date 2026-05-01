@@ -1,0 +1,13 @@
+diff --git a/UC2004/UCElements/Src/UCElements.cpp b/UC2004/UCElements/Src/UCElements.cpp
+index e6d198dc..398d371e 100644
+--- a/UC2004/UCElements/Src/UCElements.cpp
++++ b/UC2004/UCElements/Src/UCElements.cpp
+@@ -118,7 +118,7 @@ void UCanvasElement::RenderElement(UCanvas *C,FLOAT relativeDrawX,FLOAT relative
+ 			newDrawY = pos.Y;
+ 
+ 			FRotationMatrix& r = newRotation;
+-			FScaleMatrix relS(FVector(relativeScale,relativeScale,1.f));			
++			FScaleMatrix relS(FVector(relativeScale,relativeScale,1.f));
+ 
+ 			static FLOAT staticDrawX = 0.f;
+ 			static FLOAT staticDrawY = 0.f;

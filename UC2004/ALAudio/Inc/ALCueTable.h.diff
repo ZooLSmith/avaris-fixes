@@ -1,0 +1,58 @@
+diff --git a/UC2004/ALAudio/Inc/ALCueTable.h b/UC2004/ALAudio/Inc/ALCueTable.h
+new file mode 100644
+index 00000000..88e02738
+--- /dev/null
++++ b/UC2004/ALAudio/Inc/ALCueTable.h
+@@ -0,0 +1,52 @@
++/*=============================================================================
++	ALCueTable.h: Avaris.xap -> FName-keyed cue table.
++
++	The XACT project file (Avaris.xap) is plain text. We parse it once at
++	subsystem init to build TMap<FName, FCueDef> -- everything PlaySoundCue
++	needs to resolve a cue name to a .wav file plus its mixer params.
++
++	The reference implementation is in tools/dump_audio.py; this is the
++	C++ port that runs in-engine. Same three-level resolution: Cue -> Sound
++	-> Registered Wave -> Wave Entry's file path.
++=============================================================================*/
++
++#ifndef _INC_ALCUETABLE
++#define _INC_ALCUETABLE
++
++struct FCueDef
++{
++	FString WavPath;        // ..\SoundData\<Bank>\<Sound>.wav, relative to System/.
++	BYTE    Category;       // UAudioSubsystem::EVolumeCategory enum.
++	INT     VolumeMillibel; // Stored as-is from .xap (negative = quieter).
++	INT     Priority;       // 0..255.
++
++	// Pitch envelope from the .xap's "Pitch and Filter EG" block. Times
++	// are in milliseconds, Sustain is 0..100 (% of peak), PitchScaleCents
++	// is the magnitude of modulation (300 = +3 semitones at peak). The
++	// Xbox path got this from XACT for free; we evaluate ADSR ourselves
++	// in Update().
++	UBOOL   bHasPitchEG;
++	INT     EG_Delay;
++	INT     EG_Attack;
++	INT     EG_Hold;
++	INT     EG_Decay;
++	INT     EG_Sustain;
++	INT     EG_Release;
++	INT     PitchScaleCents;
++};
++
++// Parses the .xap at AbsXapPath, populates outCues by walking every Cue
++// block and resolving to its first Sound's first Registered Wave. Cues
++// whose first Sound has no waves, or whose wave's source .wav is missing
++// on disk, are skipped (the dump_audio.py audit catalogued these:
++// 19 dangling refs out of 2438 cues at last count).
++//
++// Returns the number of cues successfully resolved. The table is keyed by
++// uppercased FString rather than FName to dodge an FName-index drift seen
++// in this build: gameplay's runtime FName for a cue (e.g. "A_Weapon.ST_FireLoop"
++// at idx=37067) was different from the same-text FName we created at Init
++// (idx=16867), so TMap<FName,...>::Find missed despite identical strings.
++// String keys with appStricmp comparison sidestep the issue entirely.
++INT ParseAvarisXAP( const TCHAR* AbsXapPath, TMap<FString,FCueDef>& outCues );
++
++#endif

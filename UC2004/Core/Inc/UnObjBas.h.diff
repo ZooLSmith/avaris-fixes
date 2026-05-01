@@ -1,0 +1,32 @@
+diff --git a/UC2004/Core/Inc/UnObjBas.h b/UC2004/Core/Inc/UnObjBas.h
+index 27c70b95..d513923a 100644
+--- a/UC2004/Core/Inc/UnObjBas.h
++++ b/UC2004/Core/Inc/UnObjBas.h
+@@ -413,6 +413,13 @@ public: \
+ 		{ return &PrivateStaticClass; } \
+ 	void* operator new( size_t Size, UObject* Outer=(UObject*)GetTransientPackage(), FName Name=NAME_None, DWORD SetFlags=0 ) \
+ 		{ return StaticAllocateObject( StaticClass(), Outer, Name, SetFlags ); } \
++	/* vs2003-port fix: explicit `const TCHAR*` overload. VS 2003 SP1's optimizer */ \
++	/* mishandles the implicit TCHAR*->FName conversion at placement-new sites -- */ \
++	/* it pushes the constructor's returned `this` (a stack address) where the */ \
++	/* FName's Index VALUE should go. Constructing the FName into a named local */ \
++	/* in this overload's body forces the compiler to reload from the stack slot. */ \
++	void* operator new( size_t Size, UObject* Outer, const TCHAR* Name, DWORD SetFlags=0 ) \
++		{ FName _N( Name, FNAME_Add ); return StaticAllocateObject( StaticClass(), Outer, _N, SetFlags ); } \
+ 	void* operator new( size_t Size, EInternal* Mem ) \
+ 		{ return (void*)Mem; }
+ #else
+@@ -438,6 +445,13 @@ public: \
+ 	} \
+ 	void* operator new( size_t Size, UObject* Outer=(UObject*)GetTransientPackage(), FName Name=NAME_None, DWORD SetFlags=0 ) \
+ 		{ return StaticAllocateObject( StaticClass(), Outer, Name, SetFlags ); } \
++	/* vs2003-port fix: explicit `const TCHAR*` overload. VS 2003 SP1's optimizer */ \
++	/* mishandles the implicit TCHAR*->FName conversion at placement-new sites -- */ \
++	/* it pushes the constructor's returned `this` (a stack address) where the */ \
++	/* FName's Index VALUE should go. Constructing the FName into a named local */ \
++	/* in this overload's body forces the compiler to reload from the stack slot. */ \
++	void* operator new( size_t Size, UObject* Outer, const TCHAR* Name, DWORD SetFlags=0 ) \
++		{ FName _N( Name, FNAME_Add ); return StaticAllocateObject( StaticClass(), Outer, _N, SetFlags ); } \
+ 	void* operator new( size_t Size, EInternal* Mem ) \
+ 		{ return (void*)Mem; }
+ #endif
